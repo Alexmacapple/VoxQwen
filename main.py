@@ -410,7 +410,7 @@ async def voice_design(request: DesignRequest):
 async def voice_clone(
     text: str = Form(..., description="Texte a synthetiser"),
     reference_audio: Optional[UploadFile] = File(None, description="Audio de reference (1-30 sec). Requis si pas de prompt_id."),
-    reference_text: str = Form("", description="Transcription de l'audio de reference (optionnel mais recommande)"),
+    reference_text: str = Form("", description="Transcription de l'audio de reference (REQUIS pour le clonage)"),
     language: str = Form("fr", description="Langue cible"),
     model: str = Form("1.7B", description="Modele: '1.7B' (qualite) ou '0.6B' (rapide)"),
     prompt_id: str = Form("", description="ID d'un prompt existant (si fourni, reference_audio est ignore)"),
@@ -419,12 +419,13 @@ async def voice_clone(
     Voice Clone - Clone une voix depuis un audio de reference ou un prompt existant.
 
     Deux modes d'utilisation:
-    1. Avec reference_audio: L'audio est traite a chaque requete (plus lent)
+    1. Avec reference_audio + reference_text: L'audio est traite a chaque requete (plus lent)
     2. Avec prompt_id: Reutilise un prompt cree via /clone/prompt (plus rapide)
 
-    L'audio de reference doit faire entre 1 et 30 secondes.
-    La transcription de l'audio (reference_text) ameliore la qualite.
+    **IMPORTANT**: reference_text est obligatoire quand on utilise reference_audio.
+    C'est la transcription exacte de ce qui est dit dans l'audio de reference.
 
+    L'audio de reference doit faire entre 1 et 30 secondes.
     Formats supportes: WAV, MP3, FLAC, OGG
     Retourne: fichier WAV
     """
@@ -475,6 +476,13 @@ async def voice_clone(
                     detail="reference_audio requis si prompt_id n'est pas fourni"
                 )
 
+            # Verifier la transcription (obligatoire pour le mode ICL)
+            if not reference_text or not reference_text.strip():
+                raise HTTPException(
+                    status_code=400,
+                    detail="reference_text est obligatoire. Fournissez la transcription exacte de l'audio de reference."
+                )
+
             # Lire l'audio de reference
             audio_bytes = await reference_audio.read()
 
@@ -502,7 +510,7 @@ async def voice_clone(
                 text=text,
                 language=lang_full,
                 ref_audio=tmp_path,
-                ref_text=reference_text if reference_text else None,
+                ref_text=reference_text,
             )
 
         # Sauvegarder en memoire
@@ -530,7 +538,7 @@ async def voice_clone(
 @app.post("/clone/prompt", tags=["TTS"])
 async def create_clone_prompt(
     reference_audio: UploadFile = File(..., description="Audio de reference (1-30 sec)"),
-    reference_text: str = Form("", description="Transcription de l'audio de reference (optionnel mais recommande)"),
+    reference_text: str = Form(..., description="Transcription de l'audio de reference (REQUIS)"),
     model: str = Form("1.7B", description="Modele: '1.7B' (qualite) ou '0.6B' (rapide)"),
 ):
     """
@@ -538,6 +546,9 @@ async def create_clone_prompt(
 
     Utile pour generer plusieurs phrases avec la meme voix
     sans retraiter l'audio de reference a chaque fois.
+
+    **IMPORTANT**: reference_text est obligatoire.
+    C'est la transcription exacte de ce qui est dit dans l'audio de reference.
 
     Le prompt est stocke en memoire et peut etre reutilise via son prompt_id
     dans la route /clone.
@@ -583,7 +594,7 @@ async def create_clone_prompt(
         # Creer le prompt
         prompt_items = tts_model.create_voice_clone_prompt(
             ref_audio=tmp_path,
-            ref_text=reference_text if reference_text else None,
+            ref_text=reference_text,
         )
 
         # Nettoyer le fichier temporaire
