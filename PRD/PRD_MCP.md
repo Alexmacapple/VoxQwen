@@ -653,45 +653,102 @@ def mcp_voice_clone(request: MCPCloneRequest):
 - Ajouter exemples dans README.md
 - Tests automatisés pytest
 
-### 4.5 Page Documentation MCP
+### 4.5 Page Documentation MCP (Dynamique)
 
 #### 4.5.1 Objectif
 
-Créer une page de documentation interactive sur `/mcp/docs` permettant aux développeurs de :
-- Comprendre rapidement comment intégrer VoxQwen avec Claude Code
-- Voir le statut en temps réel du serveur MCP
-- Copier des exemples curl fonctionnels
+Créer une page de documentation **dynamique** sur `/mcp/docs` qui reflète l'état réel du serveur MCP :
+- **Outils MCP réels** : Liste générée depuis FastAPI-MCP (pas hardcodée)
+- **Statut temps réel** : Modèles chargés, voix disponibles, prompts en cache
+- **Tests interactifs** : Boutons "Try it" pour tester les outils directement
+- **Exemples curl** : Générés dynamiquement avec l'URL du serveur
 
 #### 4.5.2 Structure (3 Onglets)
 
-| Onglet | Contenu |
-|--------|---------|
-| **Skill Claude Code** | Instructions installation, config JSON pour `~/.claude/settings.json` |
-| **Statut Serveur** | Version, outils MCP, modèles chargés, voix disponibles (dynamique) |
-| **Guide d'Intégration** | Exemples curl par outil, format JSON-RPC 2.0, accordions par outil |
+| Onglet | Contenu | Source de données |
+|--------|---------|-------------------|
+| **Skill Claude Code** | Instructions installation, config JSON | Statique |
+| **Statut Serveur** | Version, outils MCP, modèles, voix | `GET /mcp` + `/models/status` |
+| **Guide d'Intégration** | Exemples curl, accordions par outil | Schema FastAPI-MCP |
 
-#### 4.5.3 Fichiers Créés
+#### 4.5.3 Données Dynamiques
+
+```python
+def get_mcp_tools_from_server() -> list:
+    """
+    Récupère la liste des outils MCP réellement exposés.
+    Source: FastAPI-MCP server capabilities.
+    """
+    if mcp_server is None:
+        return []
+
+    # Récupérer les tools depuis le serveur MCP
+    tools = []
+    for tool in mcp_server.list_tools():
+        tools.append({
+            "name": tool.name,
+            "description": tool.description,
+            "parameters": tool.inputSchema,
+            "category": categorize_tool(tool.name),
+        })
+    return tools
+
+def get_live_server_status() -> dict:
+    """Statut temps réel du serveur."""
+    return {
+        "mcp_enabled": mcp_server is not None,
+        "mcp_endpoint": "/mcp" if mcp_server else None,
+        "tools_count": len(get_mcp_tools_from_server()),
+        "models": get_models_status_for_template(),
+        "voices": get_voices_for_template(),
+        "prompts_cached": len(voice_clone_prompts),
+    }
+```
+
+#### 4.5.4 Fichiers
 
 | Fichier | Description |
 |---------|-------------|
-| `templates/mcp_docs.html` | Template Jinja2 avec onglets et accordions |
+| `templates/mcp_docs.html` | Template Jinja2 avec données dynamiques |
 | `static/mcp_docs.css` | Styles CSS (design moderne, responsive) |
-| `static/mcp_docs.js` | Logique onglets, accordions, copie code |
+| `static/mcp_docs.js` | Onglets, accordions, copie, refresh AJAX |
 
-#### 4.5.4 Route FastAPI
+#### 4.5.5 Route FastAPI (Mise à jour)
 
 ```python
 @app.get("/mcp/docs", response_class=HTMLResponse, include_in_schema=False)
 async def mcp_docs(request: Request):
-    """Page de documentation MCP interactive."""
+    """Page de documentation MCP dynamique."""
     return templates.TemplateResponse("mcp_docs.html", {
         "request": request,
         "version": API_VERSION,
         "device": DEVICE,
-        "tools": get_mcp_tools_list(),
+        "mcp_enabled": mcp_server is not None,
+        "tools": get_mcp_tools_from_server(),  # Dynamique!
         "voices": get_voices_for_template(),
         "models": get_models_status_for_template(),
+        "server_url": str(request.base_url).rstrip("/"),
     })
+```
+
+#### 4.5.6 API Endpoint pour Refresh AJAX
+
+```python
+@app.get("/mcp/status", tags=["MCP"])
+async def mcp_status():
+    """Statut temps réel du serveur MCP (pour refresh AJAX)."""
+    return get_live_server_status()
+```
+
+#### 4.5.7 JavaScript - Refresh Automatique
+
+```javascript
+// Refresh du statut toutes les 30s quand l'onglet Status est actif
+async function refreshStatus() {
+    const response = await fetch('/mcp/status');
+    const data = await response.json();
+    updateStatusUI(data);
+}
 ```
 
 
