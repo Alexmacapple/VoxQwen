@@ -24,8 +24,10 @@ from typing import Optional, Dict, Any, List
 
 import torch
 import soundfile as sf
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException
-from fastapi.responses import StreamingResponse, JSONResponse
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
+from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
+from fastapi.staticfiles import StaticFiles
+from fastapi.templating import Jinja2Templates
 from pydantic import BaseModel, Field
 
 # Détection automatique de langue (lazy import)
@@ -40,6 +42,11 @@ except ImportError:
 MODELS_DIR = Path(__file__).parent / "models"
 OUTPUTS_DIR = Path(__file__).parent / "outputs"
 OUTPUTS_DIR.mkdir(exist_ok=True)
+TEMPLATES_DIR = Path(__file__).parent / "templates"
+STATIC_DIR = Path(__file__).parent / "static"
+
+# Version API
+API_VERSION = "1.3.0"
 
 # Répertoire des voix personnalisées persistantes
 CUSTOM_VOICES_DIR = Path(__file__).parent / "voices" / "custom"
@@ -97,6 +104,7 @@ API locale de synthèse vocale basée sur **Qwen3-TTS** (Alibaba), optimisée po
 - **Batch Processing** : Générer plusieurs audios en une seule requête (ZIP)
 - **Auto Language** : Détection automatique de la langue (language="auto")
 - **Tokenizer API** : Encoder/décoder du texte en tokens
+- **MCP Support** : Intégration Model Context Protocol pour Claude Code
 
 ## Modèles utilisés
 
@@ -113,12 +121,23 @@ API locale de synthèse vocale basée sur **Qwen3-TTS** (Alibaba), optimisée po
 Français, Anglais, Chinois, Japonais, Coréen, Allemand, Russe, Portugais, Espagnol, Italien
 
 **+ Détection automatique** : Utilisez `language="auto"` pour une détection automatique.
+
+## Documentation MCP
+
+Pour l'intégration avec Claude Code via MCP, consultez [/mcp/docs](/mcp/docs).
 """,
-    version="1.2.0",
+    version=API_VERSION,
     docs_url="/docs",
     redoc_url="/redoc",
     openapi_url="/openapi.json",
 )
+
+# Montage des fichiers statiques
+if STATIC_DIR.exists():
+    app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
+
+# Templates Jinja2
+templates = Jinja2Templates(directory=str(TEMPLATES_DIR)) if TEMPLATES_DIR.exists() else None
 
 # ==============================================================================
 # MODELS
@@ -1863,6 +1882,286 @@ async def tokenizer_decode(request: DetokenizeRequest):
 
 
 # ==============================================================================
+# MCP DOCUMENTATION
+# ==============================================================================
+
+def get_mcp_tools_list() -> list:
+    """Retourne la liste des outils MCP avec leurs métadonnées."""
+    return [
+        # Catégorie: Synthèse
+        {
+            "name": "tts_preset_voice",
+            "description": "Génère un audio avec une voix préréglée (native ou personnalisée)",
+            "category": "Synthèse",
+            "parameters": [
+                {"name": "text", "type": "string", "required": True, "description": "Texte à synthétiser"},
+                {"name": "voice", "type": "string", "required": False, "description": "Nom de la voix (défaut: Serena)"},
+                {"name": "language", "type": "string", "required": False, "description": "Code langue (défaut: fr)"},
+            ],
+            "curl_example": '''curl -X POST "http://localhost:8060/mcp" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "jsonrpc": "2.0",
+    "method": "tools/call",
+    "params": {
+      "name": "tts_preset_voice",
+      "arguments": {
+        "text": "Bonjour le monde",
+        "voice": "Serena",
+        "language": "fr"
+      }
+    },
+    "id": 1
+  }' ''',
+            "response_example": '''{
+  "jsonrpc": "2.0",
+  "result": {
+    "content": [{
+      "type": "text",
+      "text": "{\\"audio_base64\\":\\"UklGRiQA...\\",\\"sample_rate\\":24000}"
+    }]
+  },
+  "id": 1
+}''',
+        },
+        {
+            "name": "tts_voice_design",
+            "description": "Génère un audio avec une voix décrite en langage naturel",
+            "category": "Synthèse",
+            "parameters": [
+                {"name": "text", "type": "string", "required": True, "description": "Texte à synthétiser"},
+                {"name": "voice_description", "type": "string", "required": True, "description": "Description de la voix (ex: 'Voix féminine douce')"},
+                {"name": "language", "type": "string", "required": False, "description": "Code langue (défaut: fr)"},
+            ],
+            "curl_example": '''curl -X POST "http://localhost:8060/mcp" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "jsonrpc": "2.0",
+    "method": "tools/call",
+    "params": {
+      "name": "tts_voice_design",
+      "arguments": {
+        "text": "Bienvenue dans notre application",
+        "voice_description": "Voix masculine grave et chaleureuse",
+        "language": "fr"
+      }
+    },
+    "id": 1
+  }' ''',
+            "response_example": None,
+        },
+        {
+            "name": "tts_voice_clone",
+            "description": "Génère un audio avec une voix clonée (nécessite un prompt_id)",
+            "category": "Synthèse",
+            "parameters": [
+                {"name": "text", "type": "string", "required": True, "description": "Texte à synthétiser"},
+                {"name": "prompt_id", "type": "string", "required": True, "description": "ID du prompt créé via tts_create_clone_prompt"},
+                {"name": "language", "type": "string", "required": False, "description": "Code langue (défaut: fr)"},
+            ],
+            "curl_example": '''curl -X POST "http://localhost:8060/mcp" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "jsonrpc": "2.0",
+    "method": "tools/call",
+    "params": {
+      "name": "tts_voice_clone",
+      "arguments": {
+        "text": "Ceci est ma voix clonée",
+        "prompt_id": "abc123-def456-...",
+        "language": "fr"
+      }
+    },
+    "id": 1
+  }' ''',
+            "response_example": None,
+        },
+        # Catégorie: Gestion
+        {
+            "name": "tts_get_voices",
+            "description": "Liste toutes les voix disponibles (natives + personnalisées)",
+            "category": "Gestion",
+            "parameters": [],
+            "curl_example": '''curl -X POST "http://localhost:8060/mcp" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "jsonrpc": "2.0",
+    "method": "tools/call",
+    "params": {
+      "name": "tts_get_voices",
+      "arguments": {}
+    },
+    "id": 1
+  }' ''',
+            "response_example": '''{
+  "jsonrpc": "2.0",
+  "result": {
+    "content": [{
+      "type": "text",
+      "text": "{\\"voices\\":[{\\"name\\":\\"Serena\\",\\"type\\":\\"native\\"},...],\\"count\\":9}"
+    }]
+  },
+  "id": 1
+}''',
+        },
+        {
+            "name": "tts_get_languages",
+            "description": "Liste les langues supportées par l'API",
+            "category": "Gestion",
+            "parameters": [],
+            "curl_example": '''curl -X POST "http://localhost:8060/mcp" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "jsonrpc": "2.0",
+    "method": "tools/call",
+    "params": {
+      "name": "tts_get_languages",
+      "arguments": {}
+    },
+    "id": 1
+  }' ''',
+            "response_example": None,
+        },
+        # Catégorie: Avancé
+        {
+            "name": "tts_create_clone_prompt",
+            "description": "Crée un prompt réutilisable pour clonage vocal à partir d'un audio",
+            "category": "Avancé",
+            "parameters": [
+                {"name": "reference_audio_base64", "type": "string", "required": True, "description": "Audio de référence encodé en base64"},
+                {"name": "reference_text", "type": "string", "required": True, "description": "Transcription exacte de l'audio"},
+                {"name": "model", "type": "string", "required": False, "description": "'1.7B' (qualité) ou '0.6B' (rapide)"},
+                {"name": "name", "type": "string", "required": False, "description": "Nom pour identifier le prompt"},
+            ],
+            "curl_example": '''curl -X POST "http://localhost:8060/mcp" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "jsonrpc": "2.0",
+    "method": "tools/call",
+    "params": {
+      "name": "tts_create_clone_prompt",
+      "arguments": {
+        "reference_audio_base64": "UklGRiQA...",
+        "reference_text": "Bonjour, je suis la voix de référence.",
+        "model": "1.7B",
+        "name": "ma_voix"
+      }
+    },
+    "id": 1
+  }' ''',
+            "response_example": '''{
+  "jsonrpc": "2.0",
+  "result": {
+    "content": [{
+      "type": "text",
+      "text": "{\\"prompt_id\\":\\"abc123-def456\\",\\"name\\":\\"ma_voix\\"}"
+    }]
+  },
+  "id": 1
+}''',
+        },
+        {
+            "name": "tts_preset_instruct",
+            "description": "Synthèse avec voix native et contrôle émotionnel/style",
+            "category": "Avancé",
+            "parameters": [
+                {"name": "text", "type": "string", "required": True, "description": "Texte à synthétiser"},
+                {"name": "voice", "type": "string", "required": False, "description": "Nom de la voix native"},
+                {"name": "instruct", "type": "string", "required": False, "description": "Instruction pour l'émotion/style"},
+                {"name": "language", "type": "string", "required": False, "description": "Code langue"},
+            ],
+            "curl_example": '''curl -X POST "http://localhost:8060/mcp" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "jsonrpc": "2.0",
+    "method": "tools/call",
+    "params": {
+      "name": "tts_preset_instruct",
+      "arguments": {
+        "text": "Je suis tellement content de vous voir !",
+        "voice": "Serena",
+        "instruct": "Ton joyeux et excité",
+        "language": "fr"
+      }
+    },
+    "id": 1
+  }' ''',
+            "response_example": None,
+        },
+        {
+            "name": "tts_get_model_status",
+            "description": "Retourne le statut des modèles chargés et des ressources",
+            "category": "Avancé",
+            "parameters": [],
+            "curl_example": '''curl -X POST "http://localhost:8060/mcp" \\
+  -H "Content-Type: application/json" \\
+  -d '{
+    "jsonrpc": "2.0",
+    "method": "tools/call",
+    "params": {
+      "name": "tts_get_model_status",
+      "arguments": {}
+    },
+    "id": 1
+  }' ''',
+            "response_example": None,
+        },
+    ]
+
+
+def get_voices_for_template() -> dict:
+    """Retourne les données de voix formatées pour le template."""
+    native = [
+        {"name": name, "gender": info["gender"], "native_lang": info["native_lang"]}
+        for name, info in PRESET_VOICES.items()
+    ]
+    custom = list_custom_voices()
+
+    return {
+        "native": native,
+        "custom": custom,
+        "native_count": len(native),
+        "custom_count": len(custom),
+    }
+
+
+def get_models_status_for_template() -> dict:
+    """Retourne le statut des modèles pour le template."""
+    return {
+        "voice_design_loaded": voice_design_model is not None,
+        "voice_clone_loaded": voice_clone_model is not None,
+        "preset_voice_loaded": preset_voice_model is not None,
+        "clone_1_7b_loaded": clone_model_1_7b is not None,
+        "clone_0_6b_loaded": clone_model_0_6b is not None,
+        "prompts_cached": len(voice_clone_prompts),
+    }
+
+
+@app.get("/mcp/docs", response_class=HTMLResponse, include_in_schema=False)
+async def mcp_docs(request: Request):
+    """
+    Page de documentation MCP interactive.
+
+    Affiche les instructions d'installation pour Claude Code,
+    le statut du serveur et un guide d'intégration avec exemples curl.
+    """
+    if templates is None:
+        return HTMLResponse(
+            content="<h1>Erreur</h1><p>Templates non disponibles. Créez le dossier templates/</p>",
+            status_code=500
+        )
+
+    return templates.TemplateResponse("mcp_docs.html", {
+        "request": request,
+        "version": API_VERSION,
+        "device": DEVICE,
+        "tools": get_mcp_tools_list(),
+        "voices": get_voices_for_template(),
+        "models": get_models_status_for_template(),
+    })
+
+
+# ==============================================================================
 # MAIN
 # ==============================================================================
 
@@ -1877,7 +2176,7 @@ if __name__ == "__main__":
 
     print(f"""
     ╔══════════════════════════════════════════════════════════╗
-    ║                     TTS-ALEX v1.2.0                      ║
+    ║                     TTS-ALEX v{API_VERSION}                      ║
     ║          API locale Qwen3-TTS pour Mac Studio            ║
     ╠══════════════════════════════════════════════════════════╣
     ║  Appareil : {DEVICE:<44} ║
@@ -1894,14 +2193,16 @@ if __name__ == "__main__":
     ║    POST /clone            - Voice Clone                  ║
     ║    POST /clone/prompt     - Créer prompt réutilisable    ║
     ╠══════════════════════════════════════════════════════════╣
-    ║  Nouvelles routes (v1.2) :                               ║
+    ║  Batch & Tokenizer (v1.2) :                              ║
     ║    POST /batch/preset     - Batch preset (ZIP)           ║
     ║    POST /batch/design     - Batch design (ZIP)           ║
     ║    POST /batch/clone      - Batch clone (ZIP)            ║
     ║    POST /tokenizer/encode - Texte → tokens               ║
     ║    POST /tokenizer/decode - Tokens → texte               ║
     ╠══════════════════════════════════════════════════════════╣
-    ║  Docs : http://localhost:8060/docs                       ║
+    ║  Documentation :                                         ║
+    ║    http://localhost:8060/docs      - Swagger UI          ║
+    ║    http://localhost:8060/mcp/docs  - MCP Documentation   ║
     ╚══════════════════════════════════════════════════════════╝
     """)
 

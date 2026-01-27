@@ -1,0 +1,286 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>VoxQwen MCP Documentation</title>
+    <link rel="stylesheet" href="/static/mcp_docs.css">
+</head>
+<body>
+    <header>
+        <h1>🎙️ VoxQwen MCP</h1>
+        <p class="subtitle">API de synthèse vocale Qwen3-TTS via Model Context Protocol</p>
+        <div class="header-badges">
+            <span class="badge version">v{{ version }}</span>
+            <span class="badge device">{{ device }}</span>
+        </div>
+    </header>
+
+    <!-- Navigation par onglets -->
+    <nav class="tabs">
+        <button class="tab active" data-tab="claude">Skill Claude Code</button>
+        <button class="tab" data-tab="status">Statut Serveur</button>
+        <button class="tab" data-tab="guide">Guide d'Intégration</button>
+    </nav>
+
+    <!-- Onglet 1: Claude Code -->
+    <section id="claude" class="tab-content active">
+        <h2>Installation du Skill Claude Code</h2>
+
+        <div class="info-box">
+            <h3>📋 Configuration</h3>
+            <p>Ajoutez VoxQwen à votre configuration Claude Code :</p>
+            <div class="code-block">
+                <pre><code>{
+  "mcpServers": {
+    "voxqwen": {
+      "url": "http://localhost:8060/mcp"
+    }
+  }
+}</code></pre>
+                <button class="copy-btn" onclick="copyCode(this)">Copier</button>
+            </div>
+            <p class="note">📁 Fichier : <code>~/.claude/settings.json</code></p>
+        </div>
+
+        <div class="info-box">
+            <h3>🚀 Utilisation</h3>
+            <p>Une fois configuré, demandez simplement à Claude :</p>
+            <ul class="example-list">
+                <li>"Génère un audio qui dit 'Bonjour le monde' avec la voix Serena"</li>
+                <li>"Clone ma voix depuis ce fichier audio et dis 'Merci beaucoup'"</li>
+                <li>"Crée une voix masculine grave et génère 'Bienvenue'"</li>
+                <li>"Liste les voix disponibles"</li>
+            </ul>
+        </div>
+
+        <div class="info-box">
+            <h3>🛠️ Outils MCP Disponibles</h3>
+            <table class="tools-table">
+                <thead>
+                    <tr>
+                        <th>Outil</th>
+                        <th>Description</th>
+                        <th>Catégorie</th>
+                    </tr>
+                </thead>
+                <tbody>
+                    {% for tool in tools %}
+                    <tr>
+                        <td><code>{{ tool.name }}</code></td>
+                        <td>{{ tool.description }}</td>
+                        <td><span class="category-badge {{ tool.category|lower }}">{{ tool.category }}</span></td>
+                    </tr>
+                    {% endfor %}
+                </tbody>
+            </table>
+        </div>
+    </section>
+
+    <!-- Onglet 2: Statut Serveur (dynamique) -->
+    <section id="status" class="tab-content">
+        <h2>Statut du Serveur MCP</h2>
+
+        <div class="status-grid">
+            <div class="status-card">
+                <div class="status-icon">📊</div>
+                <div class="status-info">
+                    <span class="status-label">Version API</span>
+                    <span class="status-value">{{ version }}</span>
+                </div>
+            </div>
+            <div class="status-card">
+                <div class="status-icon">🔧</div>
+                <div class="status-info">
+                    <span class="status-label">Outils MCP</span>
+                    <span class="status-value">{{ tools|length }}</span>
+                </div>
+            </div>
+            <div class="status-card">
+                <div class="status-icon">🎤</div>
+                <div class="status-info">
+                    <span class="status-label">Voix natives</span>
+                    <span class="status-value">{{ voices.native_count }}</span>
+                </div>
+            </div>
+            <div class="status-card">
+                <div class="status-icon">✨</div>
+                <div class="status-info">
+                    <span class="status-label">Voix custom</span>
+                    <span class="status-value">{{ voices.custom_count }}</span>
+                </div>
+            </div>
+            <div class="status-card">
+                <div class="status-icon">💻</div>
+                <div class="status-info">
+                    <span class="status-label">Device</span>
+                    <span class="status-value">{{ device }}</span>
+                </div>
+            </div>
+            <div class="status-card">
+                <div class="status-icon">🧠</div>
+                <div class="status-info">
+                    <span class="status-label">Prompts en cache</span>
+                    <span class="status-value">{{ models.prompts_cached }}</span>
+                </div>
+            </div>
+        </div>
+
+        <h3>Modèles disponibles</h3>
+        <div class="models-list">
+            <div class="model-item {{ 'loaded' if models.voice_design_loaded else 'unloaded' }}">
+                <span class="model-status">{{ '✓' if models.voice_design_loaded else '○' }}</span>
+                <span class="model-name">1.7B-VoiceDesign</span>
+                <span class="model-desc">Création de voix par description</span>
+            </div>
+            <div class="model-item {{ 'loaded' if models.voice_clone_loaded else 'unloaded' }}">
+                <span class="model-status">{{ '✓' if models.voice_clone_loaded else '○' }}</span>
+                <span class="model-name">1.7B-CustomVoice</span>
+                <span class="model-desc">Voix préréglées + émotions</span>
+            </div>
+            <div class="model-item {{ 'loaded' if models.clone_1_7b_loaded else 'unloaded' }}">
+                <span class="model-status">{{ '✓' if models.clone_1_7b_loaded else '○' }}</span>
+                <span class="model-name">1.7B-Base</span>
+                <span class="model-desc">Clonage vocal haute qualité</span>
+            </div>
+            <div class="model-item {{ 'loaded' if models.preset_voice_loaded else 'unloaded' }}">
+                <span class="model-status">{{ '✓' if models.preset_voice_loaded else '○' }}</span>
+                <span class="model-name">0.6B-CustomVoice</span>
+                <span class="model-desc">Voix préréglées (rapide)</span>
+            </div>
+            <div class="model-item {{ 'loaded' if models.clone_0_6b_loaded else 'unloaded' }}">
+                <span class="model-status">{{ '✓' if models.clone_0_6b_loaded else '○' }}</span>
+                <span class="model-name">0.6B-Base</span>
+                <span class="model-desc">Clonage vocal rapide</span>
+            </div>
+        </div>
+
+        <h3>Voix natives disponibles</h3>
+        <div class="voices-grid">
+            {% for voice in voices.native %}
+            <div class="voice-card">
+                <span class="voice-name">{{ voice.name }}</span>
+                <span class="voice-gender">{{ voice.gender }}</span>
+                <span class="voice-lang">{{ voice.native_lang }}</span>
+            </div>
+            {% endfor %}
+        </div>
+    </section>
+
+    <!-- Onglet 3: Guide d'Intégration -->
+    <section id="guide" class="tab-content">
+        <h2>Guide d'Intégration</h2>
+
+        <div class="info-box warning">
+            <h3>⚠️ Format JSON-RPC 2.0</h3>
+            <p>Le protocole MCP utilise JSON-RPC 2.0 via SSE (Server-Sent Events). Les requêtes se font sur <code>/mcp</code>.</p>
+        </div>
+
+        <h3>Exemples par outil</h3>
+
+        <!-- Accordions par outil -->
+        {% for tool in tools %}
+        <div class="tool-accordion">
+            <div class="tool-header" onclick="toggleAccordion(this)">
+                <div class="tool-title">
+                    <span class="tool-name">{{ tool.name }}</span>
+                    <span class="category-badge {{ tool.category|lower }}">{{ tool.category }}</span>
+                </div>
+                <span class="chevron">▼</span>
+            </div>
+            <div class="tool-content">
+                <p class="tool-description">{{ tool.description }}</p>
+
+                {% if tool.parameters %}
+                <h4>Paramètres</h4>
+                <table class="params-table">
+                    <thead>
+                        <tr>
+                            <th>Nom</th>
+                            <th>Type</th>
+                            <th>Requis</th>
+                            <th>Description</th>
+                        </tr>
+                    </thead>
+                    <tbody>
+                        {% for param in tool.parameters %}
+                        <tr>
+                            <td><code>{{ param.name }}</code></td>
+                            <td>{{ param.type }}</td>
+                            <td>{{ '✓' if param.required else '○' }}</td>
+                            <td>{{ param.description }}</td>
+                        </tr>
+                        {% endfor %}
+                    </tbody>
+                </table>
+                {% endif %}
+
+                <h4>Exemple curl</h4>
+                <div class="code-block">
+                    <pre><code>{{ tool.curl_example }}</code></pre>
+                    <button class="copy-btn" onclick="copyCode(this)">Copier</button>
+                </div>
+
+                {% if tool.response_example %}
+                <h4>Exemple de réponse</h4>
+                <div class="code-block response">
+                    <pre><code>{{ tool.response_example }}</code></pre>
+                </div>
+                {% endif %}
+            </div>
+        </div>
+        {% endfor %}
+
+        <h3>Format de requête JSON-RPC</h3>
+        <div class="code-block">
+            <pre><code>{
+  "jsonrpc": "2.0",
+  "method": "tools/call",
+  "params": {
+    "name": "tts_preset_voice",
+    "arguments": {
+      "text": "Bonjour le monde",
+      "voice": "Serena",
+      "language": "fr"
+    }
+  },
+  "id": 1
+}</code></pre>
+            <button class="copy-btn" onclick="copyCode(this)">Copier</button>
+        </div>
+
+        <h3>Format de réponse</h3>
+        <div class="code-block response">
+            <pre><code>{
+  "jsonrpc": "2.0",
+  "result": {
+    "content": [
+      {
+        "type": "text",
+        "text": "{\"audio_base64\":\"UklGRiQA...\",\"sample_rate\":24000,\"format\":\"wav\"}"
+      }
+    ]
+  },
+  "id": 1
+}</code></pre>
+        </div>
+
+        <div class="info-box">
+            <h3>💡 Notes importantes</h3>
+            <ul>
+                <li>L'audio est retourné en <strong>base64</strong> dans le champ <code>audio_base64</code></li>
+                <li>Le format de sortie est toujours <strong>WAV 24kHz mono</strong></li>
+                <li>Pour les prompts de clonage, utilisez d'abord <code>tts_create_clone_prompt</code> puis <code>tts_voice_clone</code></li>
+                <li>Les prompts sont stockés en mémoire et perdus au redémarrage</li>
+            </ul>
+        </div>
+    </section>
+
+    <footer>
+        <p>VoxQwen MCP v{{ version }} · Propulsé par <a href="https://github.com/QwenLM/Qwen3-TTS" target="_blank">Qwen3-TTS</a></p>
+        <p>Documentation API REST : <a href="/docs">/docs</a> · <a href="/redoc">/redoc</a></p>
+    </footer>
+
+    <script src="/static/mcp_docs.js"></script>
+</body>
+</html>
