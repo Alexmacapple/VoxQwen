@@ -1,0 +1,7 @@
+{
+  "mcpServers": {
+    "voxqwen": {
+      "url": "http://localhost:8060/mcp"
+    }
+  }
+}
