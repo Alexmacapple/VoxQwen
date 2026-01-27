@@ -1,92 +1,64 @@
-# TTS-Alex - Qwen3-TTS Local API
+# VoxQwen - Qwen3-TTS Local API
 
-API locale pour Qwen3-TTS sur Mac Studio (Apple Silicon / MPS).
+API locale de synthèse vocale basée sur Qwen3-TTS (Alibaba), optimisée pour Mac Studio / Apple Silicon. Voice Design, Voice Clone, 9 voix préréglées, batch processing, détection auto de langue. FastAPI + PyTorch MPS. Génération audio haute qualité 100% local, sans cloud.
 
-## Fonctionnalites
+## Fonctionnalités
 
-| Route | Fonction | Modele |
+| Route | Fonction | Modèle |
 |-------|----------|--------|
 | `GET /` | Health check | - |
-| `GET /languages` | Liste des 10 langues supportees | - |
-| `GET /voices` | Liste des 9 voix prereglees | - |
-| `POST /preset` | Voix prereglees (rapide) | 0.6B-CustomVoice |
-| `POST /preset/instruct` | Voix prereglees + controle emotions/styles | 1.7B-CustomVoice |
-| `POST /design` | Voice Design (creation de voix par description) | 1.7B-VoiceDesign |
+| `GET /languages` | Liste des 10 langues supportées | - |
+| `GET /voices` | Liste des voix (natives + personnalisées) | - |
+| `POST /voices/custom` | Créer une voix personnalisée persistante | 1.7B-Base / 0.6B-Base |
+| `GET /voices/custom/{name}` | Détails d'une voix personnalisée | - |
+| `DELETE /voices/custom/{name}` | Supprimer une voix personnalisée | - |
+| `POST /preset` | Voix préréglées (rapide) | 0.6B-CustomVoice |
+| `POST /preset/instruct` | Voix préréglées + contrôle émotions/styles | 1.7B-CustomVoice |
+| `POST /design` | Voice Design (création de voix par description) | 1.7B-VoiceDesign |
 | `POST /clone` | Voice Clone (clonage depuis audio ou prompt) | 1.7B-Base / 0.6B-Base |
-| `POST /clone/prompt` | Creer un prompt reutilisable pour clonage | 1.7B-Base / 0.6B-Base |
+| `POST /clone/prompt` | Créer un prompt réutilisable pour clonage | 1.7B-Base / 0.6B-Base |
 | `GET /clone/prompts` | Lister les prompts en cache | - |
 | `DELETE /clone/prompts/{id}` | Supprimer un prompt | - |
-| `GET /models/status` | Statut des modeles charges | - |
-| `POST /models/preload` | Pre-charger les modeles | - |
+| `POST /batch/preset` | Batch preset voice (retourne ZIP) | Variable |
+| `POST /batch/design` | Batch voice design (retourne ZIP) | 1.7B-VoiceDesign |
+| `POST /batch/clone` | Batch voice clone (retourne ZIP) | 1.7B-Base / 0.6B-Base |
+| `POST /tokenizer/encode` | Encoder texte en tokens | - |
+| `POST /tokenizer/decode` | Décoder tokens en texte | - |
+| `GET /models/status` | Statut des modèles chargés | - |
+| `POST /models/preload` | Pré-charger les modèles | - |
 
 ## Installation Rapide
 
 ```bash
-cd /Users/alex/LOIC/tts-alex
-./setup.sh
-```
-
-Ou manuellement :
-
-```bash
-cd /Users/alex/LOIC/tts-alex
+git clone https://github.com/Alexmacapple/VoxQwen.git
+cd VoxQwen
 python3.12 -m venv venv
 source venv/bin/activate
 pip install -r requirements.txt
+pip install langdetect  # Optionnel: détection auto de langue
 ```
 
-## Telechargement des Modeles
+## Téléchargement des Modèles
 
 ```bash
 source venv/bin/activate
-python download_models.py              # Tous les modeles (~18GB)
-python download_models.py --list       # Voir les modeles disponibles
-python download_models.py --model 1.7B-VoiceDesign  # Un modele specifique
+python models/download_models.py              # Tous les modèles (~18GB)
+python models/download_models.py --list       # Voir les modèles disponibles
+python models/download_models.py --model 1.7B-VoiceDesign  # Un modèle spécifique
 ```
 
-## Demarrage
+## Démarrage
 
 ```bash
 source venv/bin/activate
 python main.py
 # API disponible sur http://localhost:8060
+# Documentation Swagger: http://localhost:8060/docs
 ```
 
-### Redemarrer le serveur
+## Exemples d'utilisation
 
-Apres modification de `main.py`, il faut redemarrer le serveur :
-
-```bash
-# Methode 1 : Manuelle
-lsof -i :8060                    # Trouver le PID
-kill <PID>                       # Arreter le serveur
-python main.py                   # Relancer
-
-# Methode 2 : Une seule commande
-kill $(lsof -t -i :8060) 2>/dev/null; python main.py
-```
-
-## Documentation API (Swagger/OpenAPI)
-
-L'API genere automatiquement une documentation interactive conforme OpenAPI 3.1 :
-
-| URL | Description |
-|-----|-------------|
-| http://localhost:8060/docs | **Swagger UI** - Interface interactive pour tester les routes |
-| http://localhost:8060/redoc | **ReDoc** - Documentation alternative plus lisible |
-| http://localhost:8060/openapi.json | **Schema OpenAPI 3.1** - JSON brut pour integration |
-
-```bash
-# Ouvrir la documentation Swagger dans le navigateur
-open http://localhost:8060/docs
-
-# Telecharger le schema OpenAPI
-curl http://localhost:8060/openapi.json -o openapi.json
-```
-
-## Utilisation
-
-### Preset Voice (voix prereglees - rapide)
+### Preset Voice (voix préréglées)
 
 ```bash
 curl -X POST http://localhost:8060/preset \
@@ -98,29 +70,24 @@ curl -X POST http://localhost:8060/preset \
 
 Voix disponibles: Vivian, Serena, Uncle_Fu, Dylan, Eric, Ryan, Aiden, Ono_Anna, Sohee
 
-### Preset Voice avec controle emotionnel (1.7B)
+### Preset Voice avec contrôle émotionnel
 
 ```bash
 curl -X POST http://localhost:8060/preset/instruct \
   -F "text=Je viens d'apprendre la nouvelle!" \
   -F "voice=Serena" \
-  -F "instruct=Ton tres joyeux et excite" \
+  -F "instruct=Ton très joyeux et excité" \
   -F "language=fr" \
   --output preset_joyeux.wav
 ```
 
-Exemples d'instructions:
-- Emotions: "Triste et melancolique", "En colere et frustree", "Effrayee et anxieuse"
-- Styles: "Chuchotant doucement", "Parlant tres vite", "Tres dramatique et theatral"
-- Scenarios: "Commentateur sportif energique", "Presentation professionnelle"
-
-### Voice Design (creation de voix par description)
+### Voice Design (création de voix par description)
 
 ```bash
 curl -X POST http://localhost:8060/design \
   -H "Content-Type: application/json" \
   -d '{
-    "text": "Bonjour, je suis une voix generee par IA.",
+    "text": "Bonjour, je suis une voix générée par IA.",
     "voice_instruct": "Voix masculine grave, style narrateur documentaire",
     "language": "fr"
   }' \
@@ -130,104 +97,108 @@ curl -X POST http://localhost:8060/design \
 ### Voice Clone (clonage de voix)
 
 ```bash
-# Mode simple : clonage direct (retraite l'audio a chaque requete)
+# Clonage direct
 curl -X POST http://localhost:8060/clone \
   -F "text=Bonjour, je suis un clone de votre voix." \
   -F "reference_audio=@ma_voix.wav" \
-  -F "reference_text=Transcription de l'audio de reference" \
+  -F "reference_text=Transcription exacte de l'audio" \
   -F "language=fr" \
   -F "model=1.7B" \
   --output clone.wav
-
-# Avec le modele 0.6B (plus rapide, qualite legerement inferieure)
-curl -X POST http://localhost:8060/clone \
-  -F "text=Generation rapide." \
-  -F "reference_audio=@ma_voix.wav" \
-  -F "model=0.6B" \
-  -F "language=fr" \
-  --output clone_rapide.wav
 ```
 
-### Voice Clone avec prompts reutilisables (recommande pour plusieurs phrases)
+### Voix personnalisées persistantes
 
 ```bash
-# 1. Creer un prompt reutilisable (traite l'audio une seule fois)
-curl -X POST http://localhost:8060/clone/prompt \
+# 1. Créer une voix personnalisée (persiste après redémarrage)
+curl -X POST http://localhost:8060/voices/custom \
+  -F "name=ma-voix" \
+  -F "source=clone" \
   -F "reference_audio=@ma_voix.wav" \
-  -F "reference_text=Bonjour, ceci est ma voix de reference." \
-  -F "model=1.7B"
+  -F "reference_text=Transcription exacte"
 
-# Reponse: {"prompt_id": "abc123-...", "model": "1.7B", "created_at": "..."}
-
-# 2. Utiliser le prompt pour generer plusieurs audios (beaucoup plus rapide!)
-curl -X POST http://localhost:8060/clone \
-  -F "text=Premiere phrase avec ma voix clonee." \
-  -F "prompt_id=abc123-..." \
+# 2. Utiliser la voix par son nom
+curl -X POST http://localhost:8060/preset \
+  -F "text=Bonjour avec ma voix personnalisée" \
+  -F "voice=ma-voix" \
   -F "language=fr" \
-  --output phrase1.wav
-
-curl -X POST http://localhost:8060/clone \
-  -F "text=Deuxieme phrase, meme voix, sans retraiter l'audio!" \
-  -F "prompt_id=abc123-..." \
-  -F "language=fr" \
-  --output phrase2.wav
-
-# 3. Lister les prompts en cache
-curl http://localhost:8060/clone/prompts
-
-# 4. Supprimer un prompt
-curl -X DELETE http://localhost:8060/clone/prompts/abc123-...
+  --output custom.wav
 ```
 
-## Modeles Disponibles
+### Batch Processing (génération multiple)
 
-Tous les modeles sont stockes localement dans `models/` (pas de cache HuggingFace).
+```bash
+# Générer plusieurs audios en une requête (retourne ZIP)
+curl -X POST http://localhost:8060/batch/preset \
+  -H "Content-Type: application/json" \
+  -d '{"texts": ["Phrase 1", "Phrase 2", "Phrase 3"], "voice": "Serena"}' \
+  -o batch.zip
+```
 
-| Modele | Taille | Utilisation |
+### Détection automatique de langue
+
+```bash
+# language=auto détecte automatiquement la langue
+curl -X POST http://localhost:8060/preset \
+  -F "text=Hello, how are you today?" \
+  -F "voice=Serena" \
+  -F "language=auto" \
+  --output auto_detect.wav
+```
+
+### Tokenizer API
+
+```bash
+# Encoder du texte en tokens
+curl -X POST http://localhost:8060/tokenizer/encode \
+  -H "Content-Type: application/json" \
+  -d '{"text": "Bonjour"}'
+
+# Décoder des tokens en texte
+curl -X POST http://localhost:8060/tokenizer/decode \
+  -H "Content-Type: application/json" \
+  -d '{"tokens": [81581]}'
+```
+
+## Modèles Disponibles
+
+| Modèle | Taille | Utilisation |
 |--------|--------|-------------|
-| `0.6B-CustomVoice` | 2.3 GB | 9 voix prereglees, 10 langues (`/preset`) |
-| `0.6B-Base` | 2.3 GB | Clonage vocal rapide (`/clone` avec model=0.6B) |
-| `1.7B-VoiceDesign` | 4.2 GB | Creation de voix par description (`/design`) |
-| `1.7B-CustomVoice` | 4.2 GB | Voix prereglees + emotions (`/preset/instruct`) |
-| `1.7B-Base` | 4.2 GB | Clonage vocal haute qualite (`/clone` avec model=1.7B) |
-| `Tokenizer` | 651 MB | Speech tokenizer (requis par tous les modeles) |
+| `0.6B-CustomVoice` | 2.3 GB | Voix préréglées rapides |
+| `0.6B-Base` | 2.3 GB | Clonage vocal rapide |
+| `1.7B-VoiceDesign` | 4.2 GB | Création de voix par description |
+| `1.7B-CustomVoice` | 4.2 GB | Voix préréglées + émotions |
+| `1.7B-Base` | 4.2 GB | Clonage vocal haute qualité |
+| `Tokenizer` | 651 MB | Speech tokenizer (requis) |
 
 **Total : ~18 GB**
 
-## Langues Supportees
+## Langues Supportées
 
-Francais, Anglais, Chinois, Japonais, Coreen, Allemand, Russe, Portugais, Espagnol, Italien
+Français, Anglais, Chinois, Japonais, Coréen, Allemand, Russe, Portugais, Espagnol, Italien
 
-## Structure du Projet
+**+ Détection automatique** : `language=auto` (nécessite `pip install langdetect`)
 
-```
-tts-alex/
-├── main.py              # API FastAPI
-├── download_models.py   # Script de telechargement des modeles
-├── setup.sh             # Script d'installation
-├── requirements.txt     # Dependances Python
-├── models/              # Modeles Qwen3-TTS (locaux)
-│   ├── 0.6B-CustomVoice/
-│   ├── 0.6B-Base/
-│   ├── 1.7B-VoiceDesign/
-│   ├── 1.7B-CustomVoice/
-│   ├── 1.7B-Base/
-│   └── Tokenizer/
-├── outputs/             # Fichiers audio generes
-├── venv/                # Environnement virtuel Python
-└── Documentation/       # Guides et documentation
-```
+## Documentation API
+
+| URL | Description |
+|-----|-------------|
+| http://localhost:8060/docs | Swagger UI - Interface interactive |
+| http://localhost:8060/redoc | ReDoc - Documentation lisible |
+| http://localhost:8060/openapi.json | Schéma OpenAPI 3.1 |
 
 ## Configuration Technique
 
 - **Python** : 3.12
-- **Device** : MPS (Apple Silicon)
+- **Device** : MPS (Apple Silicon) / CUDA / CPU
 - **PyTorch** : 2.1+
-- **TorchCodec** : 0.10+ (requis pour le clonage vocal)
 - **Port API** : 8060
 
 ## Ressources
 
 - [Collection HuggingFace Qwen3-TTS](https://huggingface.co/collections/Qwen/qwen3-tts)
 - [GitHub Qwen3-TTS](https://github.com/QwenLM/Qwen3-TTS)
-- [Demo HuggingFace](https://huggingface.co/spaces/Qwen/Qwen3-TTS)
+
+## Licence
+
+MIT
