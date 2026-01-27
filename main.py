@@ -22,13 +22,18 @@ from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any, List
 
+import base64
 import torch
 import soundfile as sf
-from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request
+from fastapi import FastAPI, File, UploadFile, Form, HTTPException, Request, Depends
 from fastapi.responses import StreamingResponse, JSONResponse, HTMLResponse
 from fastapi.staticfiles import StaticFiles
 from fastapi.templating import Jinja2Templates
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+from slowapi.errors import RateLimitExceeded
+from fastapi_mcp import FastApiMCP
 
 # Détection automatique de langue (lazy import)
 langdetect_available = False
@@ -46,7 +51,14 @@ TEMPLATES_DIR = Path(__file__).parent / "templates"
 STATIC_DIR = Path(__file__).parent / "static"
 
 # Version API
-API_VERSION = "1.3.0"
+API_VERSION = "1.4.0"
+
+# Rate Limiting Configuration
+MCP_RATE_LIMIT = os.getenv("VOXQWEN_RATE_LIMIT", "10/minute")
+limiter = Limiter(key_func=get_remote_address)
+
+# MCP Server (initialisé après app)
+mcp_server = None
 
 # Répertoire des voix personnalisées persistantes
 CUSTOM_VOICES_DIR = Path(__file__).parent / "voices" / "custom"
@@ -132,6 +144,22 @@ Pour l'intégration avec Claude Code via MCP, consultez [/mcp/docs](/mcp/docs).
     openapi_url="/openapi.json",
 )
 
+# Rate Limiter State
+app.state.limiter = limiter
+
+@app.exception_handler(RateLimitExceeded)
+async def rate_limit_handler(request: Request, exc: RateLimitExceeded):
+    """Handler pour les erreurs de rate limiting."""
+    return JSONResponse(
+        status_code=429,
+        content={
+            "error": "Rate limit exceeded",
+            "code": "RATE_LIMIT_EXCEEDED",
+            "detail": str(exc.detail),
+            "retry_after": 60,
+        }
+    )
+
 # Montage des fichiers statiques
 if STATIC_DIR.exists():
     app.mount("/static", StaticFiles(directory=str(STATIC_DIR)), name="static")
@@ -180,6 +208,82 @@ class LanguagesResponse(BaseModel):
     count: int
     models: dict
     device: str
+
+
+# ==============================================================================
+# MCP MODELS (Pydantic)
+# ==============================================================================
+
+class MCPPresetRequest(BaseModel):
+    """Requête MCP pour synthèse avec voix préréglée."""
+    text: str = Field(..., min_length=1, max_length=2000, description="Texte à synthétiser")
+    voice: str = Field("Serena", description="Voix native ou custom")
+    language: str = Field("fr", description="Code langue ou 'auto'")
+
+
+class MCPDesignRequest(BaseModel):
+    """Requête MCP pour Voice Design."""
+    text: str = Field(..., min_length=1, max_length=2000, description="Texte à synthétiser")
+    voice_description: str = Field(..., min_length=5, max_length=500, description="Description de la voix")
+    language: str = Field("fr", description="Code langue ou 'auto'")
+
+
+class MCPCloneRequest(BaseModel):
+    """Requête MCP pour clonage avec prompt existant."""
+    text: str = Field(..., min_length=1, max_length=2000, description="Texte à synthétiser")
+    prompt_id: str = Field(..., description="UUID du prompt (VOLATILE: perdu au redémarrage)")
+    language: str = Field("fr", description="Code langue ou 'auto'")
+
+
+class MCPCreatePromptRequest(BaseModel):
+    """Requête MCP pour créer un prompt de clonage."""
+    reference_audio_base64: str = Field(..., description="Audio WAV/MP3 en base64 (max 5MB, 1-30s)")
+    reference_text: str = Field(..., min_length=1, max_length=1000, description="Transcription exacte")
+    model: str = Field("1.7B", description="Modèle: '1.7B' ou '0.6B'")
+    name: Optional[str] = Field(None, max_length=50, description="Nom du prompt")
+
+    @field_validator('model')
+    @classmethod
+    def validate_model(cls, v):
+        if v not in ("1.7B", "0.6B"):
+            raise ValueError("model doit être '1.7B' ou '0.6B'")
+        return v
+
+
+class MCPPresetInstructRequest(BaseModel):
+    """Requête MCP pour synthèse avec contrôle émotionnel."""
+    text: str = Field(..., min_length=1, max_length=2000, description="Texte à synthétiser")
+    voice: str = Field("Serena", description="Voix native uniquement")
+    instruct: str = Field("", description="Instruction émotion/style (ex: 'Ton joyeux')")
+    language: str = Field("fr", description="Code langue ou 'auto'")
+
+
+class MCPAudioResponse(BaseModel):
+    """Réponse MCP contenant l'audio généré."""
+    audio_base64: str = Field(..., description="Audio WAV encodé en base64")
+    format: str = Field("wav", description="Format audio")
+    sample_rate: int = Field(..., description="Fréquence d'échantillonnage")
+    duration_ms: int = Field(..., description="Durée en millisecondes")
+    voice_used: str = Field(..., description="Voix utilisée")
+    model_used: str = Field(..., description="Modèle utilisé")
+    warning: Optional[str] = Field(None, description="Avertissement optionnel")
+
+
+class MCPPromptResponse(BaseModel):
+    """Réponse MCP après création de prompt."""
+    prompt_id: str
+    name: Optional[str]
+    model: str
+    created_at: str
+    warning: str = "Prompt stocké en mémoire, perdu au redémarrage. Utilisez /voices/custom pour persistance."
+
+
+class MCPErrorResponse(BaseModel):
+    """Format d'erreur MCP standardisé."""
+    error: str
+    code: str
+    suggestion: Optional[str] = None
+    retry_after: Optional[int] = None
 
 
 # Mapping des codes langue vers noms complets (requis par Qwen3-TTS)
@@ -1882,8 +1986,388 @@ async def tokenizer_decode(request: DetokenizeRequest):
 
 
 # ==============================================================================
+# MCP ROUTES (JSON-based for MCP compatibility)
+# ==============================================================================
+
+@app.post("/mcp/preset", response_model=MCPAudioResponse, tags=["MCP Tools"])
+@limiter.limit(MCP_RATE_LIMIT)
+def mcp_preset_voice(request: Request, data: MCPPresetRequest):
+    """
+    [MCP Tool] Génère un audio avec une voix préréglée.
+
+    Retourne l'audio encodé en base64 pour compatibilité MCP.
+    Limite: 2000 caractères max pour le texte.
+    """
+    try:
+        # Résoudre la langue
+        language_full = resolve_language(data.language, data.text)
+
+        # Vérifier si c'est une voix native
+        if data.voice in PRESET_VOICES:
+            model = load_preset_voice_model()
+            wavs, sr = model.generate_custom_voice(
+                text=data.text,
+                language=language_full,
+                speaker=data.voice,
+            )
+            model_used = "0.6B-CustomVoice"
+
+        # Vérifier si c'est une voix personnalisée
+        elif data.voice in custom_voices:
+            voice_data = custom_voices[data.voice]
+            meta = voice_data["meta"]
+            prompt_items = get_custom_voice_prompt(data.voice)
+
+            if prompt_items is None:
+                raise HTTPException(
+                    status_code=500,
+                    detail={"error": f"Impossible de charger la voix '{data.voice}'", "code": "VOICE_LOAD_ERROR"}
+                )
+
+            if meta.get("source") == "design" and isinstance(prompt_items, dict) and prompt_items.get("type") == "design":
+                tts_model = load_voice_design_model()
+                wavs, sr = tts_model.generate_voice_design(
+                    text=data.text,
+                    language=language_full,
+                    instruct=prompt_items["voice_description"],
+                )
+                model_used = "1.7B-VoiceDesign"
+            else:
+                model_size = meta.get("model", "1.7B")
+                tts_model = load_clone_base_model(model_size)
+                wavs, sr = tts_model.generate_voice_clone(
+                    text=data.text,
+                    language=language_full,
+                    voice_clone_prompt=prompt_items,
+                )
+                model_used = f"{model_size}-Base"
+        else:
+            all_voices = list(PRESET_VOICES.keys()) + list(custom_voices.keys())
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "error": f"Voix '{data.voice}' non trouvée",
+                    "code": "VOICE_NOT_FOUND",
+                    "suggestion": f"Voix disponibles: {', '.join(all_voices[:10])}"
+                }
+            )
+
+        # Encoder en base64
+        audio_buffer = io.BytesIO()
+        sf.write(audio_buffer, wavs[0], sr, format="WAV")
+        audio_buffer.seek(0)
+        audio_b64 = base64.b64encode(audio_buffer.read()).decode('utf-8')
+        duration_ms = int(len(wavs[0]) / sr * 1000)
+
+        return MCPAudioResponse(
+            audio_base64=audio_b64,
+            format="wav",
+            sample_rate=sr,
+            duration_ms=duration_ms,
+            voice_used=data.voice,
+            model_used=model_used,
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail={"error": str(e), "code": "GENERATION_ERROR"})
+
+
+@app.post("/mcp/design", response_model=MCPAudioResponse, tags=["MCP Tools"])
+@limiter.limit(MCP_RATE_LIMIT)
+def mcp_voice_design(request: Request, data: MCPDesignRequest):
+    """
+    [MCP Tool] Génère un audio avec une voix décrite en langage naturel.
+
+    Utilise le modèle 1.7B-VoiceDesign pour créer une voix à partir d'une description.
+    """
+    try:
+        model = load_voice_design_model()
+        language_full = resolve_language(data.language, data.text)
+
+        wavs, sr = model.generate_voice_design(
+            text=data.text,
+            language=language_full,
+            instruct=data.voice_description,
+        )
+
+        # Encoder en base64
+        audio_buffer = io.BytesIO()
+        sf.write(audio_buffer, wavs[0], sr, format="WAV")
+        audio_buffer.seek(0)
+        audio_b64 = base64.b64encode(audio_buffer.read()).decode('utf-8')
+        duration_ms = int(len(wavs[0]) / sr * 1000)
+
+        return MCPAudioResponse(
+            audio_base64=audio_b64,
+            format="wav",
+            sample_rate=sr,
+            duration_ms=duration_ms,
+            voice_used=f"design:{data.voice_description[:30]}",
+            model_used="1.7B-VoiceDesign",
+        )
+
+    except Exception as e:
+        raise HTTPException(status_code=500, detail={"error": str(e), "code": "GENERATION_ERROR"})
+
+
+@app.post("/mcp/clone", response_model=MCPAudioResponse, tags=["MCP Tools"])
+@limiter.limit(MCP_RATE_LIMIT)
+def mcp_voice_clone(request: Request, data: MCPCloneRequest):
+    """
+    [MCP Tool] Génère un audio avec une voix clonée.
+
+    Nécessite un prompt_id créé via /mcp/clone/prompt.
+
+    ⚠️ ATTENTION: Les prompts sont stockés en MÉMOIRE uniquement.
+    Ils sont perdus au redémarrage du serveur.
+    """
+    try:
+        prompt_data = get_prompt(data.prompt_id)
+        if not prompt_data:
+            raise HTTPException(
+                status_code=404,
+                detail={
+                    "error": f"Prompt '{data.prompt_id}' non trouvé",
+                    "code": "PROMPT_NOT_FOUND",
+                    "suggestion": "Les prompts sont volatils. Recréez-le via /mcp/clone/prompt"
+                }
+            )
+
+        model_size = prompt_data["model"]
+        tts_model = load_clone_base_model(model_size)
+        language_full = resolve_language(data.language, data.text)
+
+        wavs, sr = tts_model.generate_voice_clone(
+            text=data.text,
+            language=language_full,
+            voice_clone_prompt=prompt_data["prompt_items"],
+        )
+
+        # Encoder en base64
+        audio_buffer = io.BytesIO()
+        sf.write(audio_buffer, wavs[0], sr, format="WAV")
+        audio_buffer.seek(0)
+        audio_b64 = base64.b64encode(audio_buffer.read()).decode('utf-8')
+        duration_ms = int(len(wavs[0]) / sr * 1000)
+
+        return MCPAudioResponse(
+            audio_base64=audio_b64,
+            format="wav",
+            sample_rate=sr,
+            duration_ms=duration_ms,
+            voice_used=f"clone:{data.prompt_id[:8]}",
+            model_used=f"{model_size}-Base",
+            warning="Prompt stocké en mémoire, perdu au redémarrage.",
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail={"error": str(e), "code": "GENERATION_ERROR"})
+
+
+@app.post("/mcp/clone/prompt", response_model=MCPPromptResponse, tags=["MCP Tools"])
+@limiter.limit(MCP_RATE_LIMIT)
+def mcp_create_clone_prompt(request: Request, data: MCPCreatePromptRequest):
+    """
+    [MCP Tool] Crée un prompt réutilisable pour clonage vocal.
+
+    Accepte l'audio en base64 (max 5MB, 1-30 secondes).
+
+    ⚠️ ATTENTION: Les prompts sont stockés en MÉMOIRE uniquement.
+    """
+    tmp_path = None
+    try:
+        # Décoder le base64
+        try:
+            audio_bytes = base64.b64decode(data.reference_audio_base64)
+        except Exception:
+            raise HTTPException(
+                status_code=422,
+                detail={"error": "Base64 invalide", "code": "INVALID_BASE64"}
+            )
+
+        # Vérifier la taille (max 5MB)
+        if len(audio_bytes) > 5 * 1024 * 1024:
+            raise HTTPException(
+                status_code=422,
+                detail={"error": f"Audio trop grand: {len(audio_bytes) / 1024 / 1024:.1f}MB > 5MB", "code": "AUDIO_TOO_LARGE"}
+            )
+
+        # Sauvegarder temporairement
+        with tempfile.NamedTemporaryFile(suffix=".wav", delete=False) as tmp:
+            tmp.write(audio_bytes)
+            tmp_path = tmp.name
+
+        # Vérifier la durée
+        import torchaudio
+        waveform, sample_rate = torchaudio.load(tmp_path)
+        duration = waveform.shape[1] / sample_rate
+
+        if duration < 1:
+            raise HTTPException(status_code=422, detail={"error": f"Audio trop court: {duration:.1f}s (min: 1s)", "code": "AUDIO_TOO_SHORT"})
+        if duration > 30:
+            raise HTTPException(status_code=422, detail={"error": f"Audio trop long: {duration:.1f}s (max: 30s)", "code": "AUDIO_TOO_LONG"})
+
+        # Créer le prompt
+        tts_model = load_clone_base_model(data.model)
+        prompt_items = tts_model.create_voice_clone_prompt(
+            ref_audio=tmp_path,
+            ref_text=data.reference_text,
+        )
+
+        # Stocker le prompt
+        prompt_id = store_prompt(prompt_items, data.model, data.name)
+        prompt_data = get_prompt(prompt_id)
+
+        return MCPPromptResponse(
+            prompt_id=prompt_id,
+            name=data.name,
+            model=data.model,
+            created_at=prompt_data["created_at"].isoformat(),
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail={"error": str(e), "code": "PROMPT_CREATION_ERROR"})
+    finally:
+        if tmp_path and os.path.exists(tmp_path):
+            os.unlink(tmp_path)
+
+
+@app.post("/mcp/preset/instruct", response_model=MCPAudioResponse, tags=["MCP Tools"])
+@limiter.limit(MCP_RATE_LIMIT)
+def mcp_preset_instruct(request: Request, data: MCPPresetInstructRequest):
+    """
+    [MCP Tool] Génère un audio avec contrôle émotionnel/style.
+
+    Utilise le modèle 1.7B-CustomVoice pour un contrôle fin des émotions.
+    Voix natives uniquement (Serena, Vivian, etc.).
+    """
+    try:
+        if data.voice not in PRESET_VOICES:
+            raise HTTPException(
+                status_code=400,
+                detail={
+                    "error": f"Voix '{data.voice}' non supportée pour instruct",
+                    "code": "VOICE_NOT_SUPPORTED",
+                    "suggestion": f"Voix natives: {', '.join(PRESET_VOICES.keys())}"
+                }
+            )
+
+        model = load_voice_clone_model()  # 1.7B-CustomVoice
+        language_full = resolve_language(data.language, data.text)
+
+        wavs, sr = model.generate_custom_voice(
+            text=data.text,
+            language=language_full,
+            speaker=data.voice,
+            instruct=data.instruct if data.instruct else "",
+        )
+
+        # Encoder en base64
+        audio_buffer = io.BytesIO()
+        sf.write(audio_buffer, wavs[0], sr, format="WAV")
+        audio_buffer.seek(0)
+        audio_b64 = base64.b64encode(audio_buffer.read()).decode('utf-8')
+        duration_ms = int(len(wavs[0]) / sr * 1000)
+
+        return MCPAudioResponse(
+            audio_base64=audio_b64,
+            format="wav",
+            sample_rate=sr,
+            duration_ms=duration_ms,
+            voice_used=data.voice,
+            model_used="1.7B-CustomVoice",
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        raise HTTPException(status_code=500, detail={"error": str(e), "code": "GENERATION_ERROR"})
+
+
+@app.get("/mcp/voices", tags=["MCP Tools"])
+def mcp_get_voices():
+    """[MCP Tool] Liste toutes les voix disponibles."""
+    native = [{"name": name, "type": "native", **info} for name, info in PRESET_VOICES.items()]
+    custom = list_custom_voices()
+    return {
+        "voices": native + custom,
+        "count": len(native) + len(custom),
+        "native_count": len(native),
+        "custom_count": len(custom),
+    }
+
+
+@app.get("/mcp/languages", tags=["MCP Tools"])
+def mcp_get_languages():
+    """[MCP Tool] Liste les langues supportées."""
+    return {
+        "languages": [{"code": code, "name": name} for code, name in LANGUAGE_MAP.items()],
+        "count": len(LANGUAGE_MAP),
+        "auto_detection": langdetect_available,
+    }
+
+
+@app.get("/mcp/status", tags=["MCP Tools"])
+def mcp_get_status():
+    """[MCP Tool] Statut du serveur MCP et des modèles."""
+    return {
+        "mcp_enabled": mcp_server is not None,
+        "version": API_VERSION,
+        "device": DEVICE,
+        "models": {
+            "voice_design_loaded": voice_design_model is not None,
+            "voice_clone_loaded": voice_clone_model is not None,
+            "preset_voice_loaded": preset_voice_model is not None,
+            "clone_1_7b_loaded": clone_model_1_7b is not None,
+            "clone_0_6b_loaded": clone_model_0_6b is not None,
+        },
+        "voices": {
+            "native_count": len(PRESET_VOICES),
+            "custom_count": len(custom_voices),
+        },
+        "prompts_cached": len(voice_clone_prompts),
+    }
+
+
+# ==============================================================================
 # MCP DOCUMENTATION
 # ==============================================================================
+
+def get_mcp_tools_from_server() -> list:
+    """Récupère la liste des outils MCP depuis le serveur FastAPI-MCP."""
+    if mcp_server is None:
+        return []
+
+    tools = []
+    try:
+        # FastAPI-MCP expose les outils via son API interne
+        for tool in mcp_server.get_tools():
+            tools.append({
+                "name": tool.name,
+                "description": tool.description or "",
+                "parameters": tool.inputSchema if hasattr(tool, 'inputSchema') else {},
+                "category": categorize_tool(tool.name),
+            })
+    except Exception:
+        pass
+    return tools
+
+
+def categorize_tool(name: str) -> str:
+    """Catégorise un outil MCP par son nom."""
+    if "voice" in name or "preset" in name or "design" in name or "clone" in name:
+        return "Synthèse"
+    elif "status" in name or "model" in name:
+        return "Avancé"
+    else:
+        return "Gestion"
+
 
 def get_mcp_tools_list() -> list:
     """Retourne la liste des outils MCP avec leurs métadonnées."""
@@ -2140,10 +2624,11 @@ def get_models_status_for_template() -> dict:
 @app.get("/mcp/docs", response_class=HTMLResponse, include_in_schema=False)
 async def mcp_docs(request: Request):
     """
-    Page de documentation MCP interactive.
+    Page de documentation MCP dynamique.
 
     Affiche les instructions d'installation pour Claude Code,
     le statut du serveur et un guide d'intégration avec exemples curl.
+    Les outils MCP sont listés dynamiquement depuis FastAPI-MCP.
     """
     if templates is None:
         return HTMLResponse(
@@ -2151,14 +2636,35 @@ async def mcp_docs(request: Request):
             status_code=500
         )
 
+    # Utiliser les outils dynamiques si MCP est actif, sinon fallback sur la liste statique
+    tools = get_mcp_tools_from_server() if mcp_server else get_mcp_tools_list()
+
     return templates.TemplateResponse("mcp_docs.html", {
         "request": request,
         "version": API_VERSION,
         "device": DEVICE,
-        "tools": get_mcp_tools_list(),
+        "mcp_enabled": mcp_server is not None,
+        "tools": tools,
         "voices": get_voices_for_template(),
         "models": get_models_status_for_template(),
+        "server_url": str(request.base_url).rstrip("/"),
     })
+
+
+# ==============================================================================
+# FASTAPI-MCP CONFIGURATION
+# ==============================================================================
+
+# Créer le serveur MCP après toutes les routes
+mcp_server = FastApiMCP(
+    app,
+    name="VoxQwen",
+    description=f"API de synthèse vocale Qwen3-TTS v{API_VERSION} pour Mac Studio. Voice Design, Voice Clone, 9 voix préréglées.",
+    include_tags=["MCP Tools"],
+)
+
+# Monter le serveur MCP sur /mcp
+mcp_server.mount()
 
 
 # ==============================================================================
@@ -2185,24 +2691,26 @@ if __name__ == "__main__":
     ║  Voix natives : 9                                        ║
     ║  Voix personnalisées : {custom_count:<33} ║
     ║  Auto-détection langue : {langdetect_status:<30} ║
+    ║  MCP Server : Actif                                      ║
     ╠══════════════════════════════════════════════════════════╣
-    ║  Routes principales :                                    ║
+    ║  Routes REST :                                           ║
     ║    POST /preset           - Synthèse avec voix           ║
     ║    POST /preset/instruct  - Voix + émotions (1.7B)       ║
     ║    POST /design           - Voice Design                 ║
     ║    POST /clone            - Voice Clone                  ║
     ║    POST /clone/prompt     - Créer prompt réutilisable    ║
     ╠══════════════════════════════════════════════════════════╣
-    ║  Batch & Tokenizer (v1.2) :                              ║
-    ║    POST /batch/preset     - Batch preset (ZIP)           ║
-    ║    POST /batch/design     - Batch design (ZIP)           ║
-    ║    POST /batch/clone      - Batch clone (ZIP)            ║
-    ║    POST /tokenizer/encode - Texte → tokens               ║
-    ║    POST /tokenizer/decode - Tokens → texte               ║
+    ║  Routes MCP (v1.4) :                                     ║
+    ║    POST /mcp/preset       - TTS avec voix (JSON+base64)  ║
+    ║    POST /mcp/design       - Voice Design (JSON+base64)   ║
+    ║    POST /mcp/clone        - Voice Clone (JSON+base64)    ║
+    ║    GET  /mcp/voices       - Liste des voix               ║
+    ║    GET  /mcp/status       - Statut serveur MCP           ║
     ╠══════════════════════════════════════════════════════════╣
     ║  Documentation :                                         ║
     ║    http://localhost:8060/docs      - Swagger UI          ║
     ║    http://localhost:8060/mcp/docs  - MCP Documentation   ║
+    ║    http://localhost:8060/mcp       - Endpoint MCP        ║
     ╚══════════════════════════════════════════════════════════╝
     """)
 
