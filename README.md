@@ -26,6 +26,7 @@ API locale de synthèse vocale basée sur Qwen3-TTS (Alibaba), optimisée pour M
 | `POST /tokenizer/decode` | Décoder tokens en texte | - |
 | `GET /models/status` | Statut des modèles chargés | - |
 | `POST /models/preload` | Pré-charger les modèles | - |
+| `GET /mcp/docs` | Documentation MCP interactive | - |
 
 ## Installation Rapide
 
@@ -186,6 +187,7 @@ Français, Anglais, Chinois, Japonais, Coréen, Allemand, Russe, Portugais, Espa
 | http://localhost:8060/docs | Swagger UI - Interface interactive |
 | http://localhost:8060/redoc | ReDoc - Documentation lisible |
 | http://localhost:8060/openapi.json | Schéma OpenAPI 3.1 |
+| http://localhost:8060/mcp/docs | Documentation MCP pour Claude Code |
 
 ## Configuration Technique
 

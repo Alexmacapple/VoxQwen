@@ -59,6 +59,7 @@ pip install \
     fastapi \
     "uvicorn[standard]" \
     python-multipart \
+    jinja2 \
     soundfile \
     librosa \
     numpy \
@@ -92,11 +93,11 @@ echo "╠═══════════════════════�
 echo "║                                                          ║"
 echo "║  Etape suivante - Telecharger les modeles (~18GB):       ║"
 echo "║                                                          ║"
-echo "║    python download_models.py                             ║"
+echo "║    python models/download_models.py                      ║"
 echo "║                                                          ║"
 echo "║  Options:                                                ║"
-echo "║    python download_models.py --list    # Liste modeles   ║"
-echo "║    python download_models.py --model 1.7B-VoiceDesign    ║"
+echo "║    python models/download_models.py --list               ║"
+echo "║    python models/download_models.py --model 1.7B-VoiceDesign ║"
 echo "║                                                          ║"
 echo "╠══════════════════════════════════════════════════════════╣"
 echo "║  Pour demarrer l'API (apres telechargement):             ║"
@@ -106,4 +107,5 @@ echo "║    python main.py                                        ║"
 echo "║                                                          ║"
 echo "║  API: http://localhost:8060                              ║"
 echo "║  Docs: http://localhost:8060/docs                        ║"
+echo "║  MCP:  http://localhost:8060/mcp/docs                    ║"
 echo "╚══════════════════════════════════════════════════════════╝"
