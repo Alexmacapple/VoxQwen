@@ -60,6 +60,8 @@ pip install \
     "uvicorn[standard]" \
     python-multipart \
     jinja2 \
+    slowapi \
+    fastapi-mcp \
     soundfile \
     librosa \
     numpy \

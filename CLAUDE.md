@@ -6,6 +6,18 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 Toujours répondre en français.
 
+## Dépôt distant
+
+- **GitHub** : `git@github.com:Alexmacapple/VoxQwen.git` (SSH)
+- **URL publique** : `https://github.com/Alexmacapple/VoxQwen`
+
+## API
+
+- **URL** : `http://localhost:8060`
+- **Swagger UI** : `http://localhost:8060/docs`
+- **ReDoc** : `http://localhost:8060/redoc`
+- **MCP** : `http://localhost:8060/mcp/docs`
+
 ## Aperçu du Projet
 
 TTS-Alex est une API locale de synthèse vocale utilisant les modèles Qwen3-TTS, optimisée pour Mac Studio (Apple Silicon/MPS). Deux fonctionnalités principales :
@@ -203,6 +215,8 @@ L'API génère automatiquement une documentation interactive conforme OpenAPI 3.
 
 - Python 3.12
 - FastAPI + Uvicorn (port 8060)
+- fastapi-mcp (intégration MCP pour Claude Code)
+- slowapi (rate limiting)
 - PyTorch avec accélération MPS
 - qwen-tts (depuis GitHub)
 - soundfile, librosa, torchaudio pour le traitement audio
