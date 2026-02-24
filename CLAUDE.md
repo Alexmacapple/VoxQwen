@@ -103,7 +103,23 @@ Tous les modèles stockés localement dans `models/` (pas de cache HuggingFace) 
 
 Les voix personnalisées permettent de sauvegarder des voix créées via Voice Clone ou Voice Design pour les réutiliser après redémarrage du serveur.
 
-**Stockage** : `voices/custom/{name}/` avec `meta.json` + `prompt.pt`
+**Stockage sur disque** : `voices/custom/{name}/`
+
+```
+voices/custom/narrateur-dynamique/
+├── meta.json    # Métadonnées (nom, description, date, modèle, source)
+└── prompt.pt    # Embedding vocal PyTorch (~1.4 Ko = l'"ADN" de la voix)
+```
+
+**Fonctionnement interne** :
+
+1. `POST /voices/custom` envoie une description textuelle (source=design) ou un audio (source=clone)
+2. Le modèle 1.7B génère un **embedding vocal** (vecteur mathématique représentant la voix)
+3. L'embedding est sauvegardé dans `prompt.pt`, les métadonnées dans `meta.json`
+4. Au démarrage du serveur, toutes les voix dans `voices/custom/` sont rechargées automatiquement
+5. `POST /preset` avec `voice={name}` charge l'embedding et l'utilise pour la synthèse
+
+**Non-déterminisme de Voice Design** : l'embedding sauvegardé est stable, mais le décodeur audio introduit des variations à chaque génération. Le timbre, la hauteur et le genre perçu peuvent varier d'un appel à l'autre avec le même embedding. Pour une cohérence maximale, préférer **Voice Clone** (`/clone`) avec un échantillon audio humain.
 
 Workflow recommandé :
 1. `POST /voices/custom` - Créer une voix persistante (clone ou design)
