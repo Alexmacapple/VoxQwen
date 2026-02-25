@@ -641,7 +641,7 @@ def get_custom_voice_prompt(name: str):
         prompt_file = CUSTOM_VOICES_DIR / name / "prompt.pt"
         if prompt_file.exists():
             try:
-                voice_data["prompt_items"] = torch.load(prompt_file, map_location=DEVICE)
+                voice_data["prompt_items"] = torch.load(prompt_file, map_location=DEVICE, weights_only=False)
             except Exception as e:
                 print(f"Erreur chargement embeddings {name}: {e}")
                 return None
