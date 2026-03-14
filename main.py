@@ -109,6 +109,7 @@ _generation_stats = {
 }
 
 logger = logging.getLogger("voxqwen")
+logger.setLevel(logging.INFO)
 
 
 async def with_generation_lock(coro, timeout: int | None = None, endpoint: str = ""):
