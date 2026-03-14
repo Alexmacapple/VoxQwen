@@ -1859,7 +1859,7 @@ async def batch_preset_voice(request: BatchPresetRequest):
             zip_buffer.seek(0)
             return zip_buffer
 
-        batch_timeout = min(len(request.texts) * 5 + 60, GENERATION_BATCH_TIMEOUT)
+        batch_timeout = min(len(request.texts) * 60 + 60, GENERATION_BATCH_TIMEOUT)
         zip_buffer = await with_generation_lock(
             do_batch(), timeout=batch_timeout, endpoint="/batch/preset"
         )
@@ -1928,7 +1928,7 @@ async def batch_voice_design(request: BatchDesignRequest):
             zip_buffer.seek(0)
             return zip_buffer
 
-        batch_timeout = min(len(request.texts) * 6 + 60, GENERATION_BATCH_TIMEOUT)
+        batch_timeout = min(len(request.texts) * 60 + 60, GENERATION_BATCH_TIMEOUT)
         zip_buffer = await with_generation_lock(
             do_batch(), timeout=batch_timeout, endpoint="/batch/design"
         )
@@ -2011,7 +2011,7 @@ async def batch_voice_clone(
             zip_buffer.seek(0)
             return zip_buffer
 
-        batch_timeout = min(len(text_list) * 6 + 60, GENERATION_BATCH_TIMEOUT)
+        batch_timeout = min(len(text_list) * 60 + 60, GENERATION_BATCH_TIMEOUT)
         zip_buffer = await with_generation_lock(
             do_batch(), timeout=batch_timeout, endpoint="/batch/clone"
         )
