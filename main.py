@@ -17,6 +17,7 @@ import json
 import shutil
 import tempfile
 import uuid
+import asyncio
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -800,7 +801,8 @@ async def voice_design(request: DesignRequest):
         language = LANGUAGE_MAP.get(request.language, "French")
 
         # Generer l'audio
-        wavs, sr = model.generate_voice_design(
+        wavs, sr = await asyncio.to_thread(
+            model.generate_voice_design,
             text=request.text,
             language=language,
             instruct=request.voice_instruct or "Voix naturelle et claire",
@@ -879,7 +881,8 @@ async def voice_clone(
             tts_model = load_clone_base_model(model)
 
             # Generer avec le prompt stocke
-            wavs, sr = tts_model.generate_voice_clone(
+            wavs, sr = await asyncio.to_thread(
+                tts_model.generate_voice_clone,
                 text=text,
                 language=lang_full,
                 voice_clone_prompt=prompt_data["prompt_items"],
@@ -924,7 +927,8 @@ async def voice_clone(
             tts_model = load_clone_base_model(model)
 
             # Generer l'audio clone
-            wavs, sr = tts_model.generate_voice_clone(
+            wavs, sr = await asyncio.to_thread(
+                tts_model.generate_voice_clone,
                 text=text,
                 language=lang_full,
                 ref_audio=tmp_path,
@@ -1021,7 +1025,8 @@ async def create_clone_prompt(
         tts_model = load_clone_base_model(model)
 
         # Creer le prompt
-        prompt_items = tts_model.create_voice_clone_prompt(
+        prompt_items = await asyncio.to_thread(
+            tts_model.create_voice_clone_prompt,
             ref_audio=tmp_path,
             ref_text=reference_text,
         )
@@ -1259,7 +1264,8 @@ async def create_custom_voice(
 
             # Charger le modèle et créer le prompt
             tts_model = load_clone_base_model(model)
-            prompt_items = tts_model.create_voice_clone_prompt(
+            prompt_items = await asyncio.to_thread(
+                tts_model.create_voice_clone_prompt,
                 ref_audio=tmp_path,
                 ref_text=reference_text,
             )
@@ -1278,7 +1284,8 @@ async def create_custom_voice(
             # Générer un audio court pour extraire les embeddings
             # Note: Voice Design ne crée pas de prompt réutilisable directement,
             # on génère un échantillon et on stocke la description pour régénérer
-            wavs, sr = tts_model.generate_voice_design(
+            wavs, sr = await asyncio.to_thread(
+                tts_model.generate_voice_design,
                 text="Test de voix.",
                 language=lang_full,
                 instruct=voice_description,
@@ -1426,7 +1433,8 @@ async def preset_voice(
         # Vérifier si c'est une voix native
         if voice in PRESET_VOICES:
             model = load_preset_voice_model()
-            wavs, sr = model.generate_custom_voice(
+            wavs, sr = await asyncio.to_thread(
+                model.generate_custom_voice,
                 text=text,
                 language=language_full,
                 speaker=voice,
@@ -1447,7 +1455,8 @@ async def preset_voice(
             # Si c'est une voix design, régénérer avec la description
             if meta.get("source") == "design" and isinstance(prompt_items, dict) and prompt_items.get("type") == "design":
                 tts_model = load_voice_design_model()
-                wavs, sr = tts_model.generate_voice_design(
+                wavs, sr = await asyncio.to_thread(
+                    tts_model.generate_voice_design,
                     text=text,
                     language=language_full,
                     instruct=prompt_items["voice_description"],
@@ -1456,7 +1465,8 @@ async def preset_voice(
                 # Voix clonée : utiliser le prompt
                 model_size = meta.get("model", "1.7B")
                 tts_model = load_clone_base_model(model_size)
-                wavs, sr = tts_model.generate_voice_clone(
+                wavs, sr = await asyncio.to_thread(
+                    tts_model.generate_voice_clone,
                     text=text,
                     language=language_full,
                     voice_clone_prompt=prompt_items,
@@ -1532,7 +1542,8 @@ async def preset_voice_with_instruct(
         language_full = LANGUAGE_MAP.get(language, "French")
 
         # Générer l'audio avec instruction
-        wavs, sr = model.generate_custom_voice(
+        wavs, sr = await asyncio.to_thread(
+            model.generate_custom_voice,
             text=text,
             language=language_full,
             speaker=voice,
@@ -1689,7 +1700,8 @@ async def batch_preset_voice(request: BatchPresetRequest):
                 # Générer l'audio
                 if is_native:
                     model = load_preset_voice_model()
-                    wavs, sr = model.generate_custom_voice(
+                    wavs, sr = await asyncio.to_thread(
+                        model.generate_custom_voice,
                         text=text,
                         language=lang,
                         speaker=request.voice,
@@ -1708,7 +1720,8 @@ async def batch_preset_voice(request: BatchPresetRequest):
 
                     if meta.get("source") == "design" and isinstance(prompt_items, dict) and prompt_items.get("type") == "design":
                         tts_model = load_voice_design_model()
-                        wavs, sr = tts_model.generate_voice_design(
+                        wavs, sr = await asyncio.to_thread(
+                            tts_model.generate_voice_design,
                             text=text,
                             language=lang,
                             instruct=prompt_items["voice_description"],
@@ -1716,7 +1729,8 @@ async def batch_preset_voice(request: BatchPresetRequest):
                     else:
                         model_size = meta.get("model", "1.7B")
                         tts_model = load_clone_base_model(model_size)
-                        wavs, sr = tts_model.generate_voice_clone(
+                        wavs, sr = await asyncio.to_thread(
+                            tts_model.generate_voice_clone,
                             text=text,
                             language=lang,
                             voice_clone_prompt=prompt_items,
@@ -1792,7 +1806,8 @@ async def batch_voice_design(request: BatchDesignRequest):
                     lang = language_full
 
                 # Générer l'audio
-                wavs, sr = model.generate_voice_design(
+                wavs, sr = await asyncio.to_thread(
+                    model.generate_voice_design,
                     text=text,
                     language=lang,
                     instruct=request.voice_instruct or "Voix naturelle et claire",
@@ -1882,7 +1897,8 @@ async def batch_voice_clone(
                     lang = language_full
 
                 # Générer l'audio avec le prompt
-                wavs, sr = tts_model.generate_voice_clone(
+                wavs, sr = await asyncio.to_thread(
+                    tts_model.generate_voice_clone,
                     text=text,
                     language=lang,
                     voice_clone_prompt=prompt_data["prompt_items"],
