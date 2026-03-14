@@ -18,6 +18,8 @@ import shutil
 import tempfile
 import uuid
 import asyncio
+import logging
+import time
 import zipfile
 from datetime import datetime
 from pathlib import Path
@@ -89,6 +91,70 @@ voice_clone_prompts: Dict[str, Dict[str, Any]] = {}
 # Voix personnalisées persistantes (chargées depuis disque)
 # Structure: {name: {"meta": {...}, "prompt_items": ... ou None si pas encore chargé}}
 custom_voices: Dict[str, Dict[str, Any]] = {}
+
+# --- Semaphore de generation (1 seule generation GPU a la fois) ---
+GENERATION_TIMEOUT = int(os.getenv("VOXQWEN_GENERATION_TIMEOUT", "120"))
+GENERATION_QUEUE_TIMEOUT = int(os.getenv("VOXQWEN_QUEUE_TIMEOUT", "5"))
+GENERATION_BATCH_TIMEOUT = int(os.getenv("VOXQWEN_BATCH_TIMEOUT", "600"))
+
+_generation_lock = asyncio.Semaphore(1)
+_generation_active = False
+_generation_started_at: float | None = None
+_generation_endpoint: str | None = None
+
+logger = logging.getLogger("voxqwen")
+
+
+async def with_generation_lock(coro, timeout: int | None = None, endpoint: str = ""):
+    """
+    Execute une coroutine de generation avec :
+    - Semaphore (1 seule generation a la fois)
+    - Timeout sur l'acquisition (503 si occupe)
+    - Timeout sur la generation (504 si blocage)
+    - empty_cache() uniquement apres succes (pas apres timeout)
+    """
+    global _generation_active, _generation_started_at, _generation_endpoint
+    t = timeout or GENERATION_TIMEOUT
+
+    # 1. Acquisition du verrou (max QUEUE_TIMEOUT secondes)
+    try:
+        await asyncio.wait_for(
+            _generation_lock.acquire(),
+            timeout=GENERATION_QUEUE_TIMEOUT
+        )
+    except asyncio.TimeoutError:
+        raise HTTPException(
+            status_code=503,
+            detail="Moteur TTS occupe. Reessayez dans quelques secondes."
+        )
+
+    # 2. Execution avec timeout
+    _generation_active = True
+    _generation_started_at = time.time()
+    _generation_endpoint = endpoint
+    try:
+        result = await asyncio.wait_for(coro, timeout=t)
+        # 3. Nettoyage memoire GPU UNIQUEMENT apres succes
+        # ATTENTION : apres un timeout, le thread orphelin utilise encore MPS.
+        try:
+            if torch.backends.mps.is_available():
+                torch.mps.empty_cache()
+        except Exception:
+            pass
+        return result
+    except asyncio.TimeoutError:
+        # PAS de empty_cache() ici : le thread orphelin utilise encore MPS
+        logger.error(f"Generation timeout ({t}s) sur {endpoint}")
+        raise HTTPException(
+            status_code=504,
+            detail=f"Generation interrompue (timeout {t}s)."
+        )
+    finally:
+        _generation_active = False
+        _generation_started_at = None
+        _generation_endpoint = None
+        _generation_lock.release()
+
 
 # Voix prereglees du modele 0.6B-CustomVoice
 PRESET_VOICES = {
@@ -794,25 +860,24 @@ async def voice_design(request: DesignRequest):
 
     Retourne : fichier WAV
     """
-    try:
+    async def do_generate():
         model = load_voice_design_model()
-
-        # Convertir code langue en nom complet
         language = LANGUAGE_MAP.get(request.language, "French")
-
-        # Generer l'audio
         wavs, sr = await asyncio.to_thread(
             model.generate_voice_design,
             text=request.text,
             language=language,
             instruct=request.voice_instruct or "Voix naturelle et claire",
         )
-
-        # Sauvegarder en memoire
         audio_buffer = io.BytesIO()
         sf.write(audio_buffer, wavs[0], sr, format="WAV")
         audio_buffer.seek(0)
+        return audio_buffer
 
+    try:
+        audio_buffer = await with_generation_lock(
+            do_generate(), timeout=90, endpoint="/design"
+        )
         return StreamingResponse(
             audio_buffer,
             media_type="audio/wav",
@@ -821,6 +886,8 @@ async def voice_design(request: DesignRequest):
             }
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail=str(e))
 
@@ -880,12 +947,17 @@ async def voice_clone(
             # Charger le modele Base
             tts_model = load_clone_base_model(model)
 
-            # Generer avec le prompt stocke
-            wavs, sr = await asyncio.to_thread(
-                tts_model.generate_voice_clone,
-                text=text,
-                language=lang_full,
-                voice_clone_prompt=prompt_data["prompt_items"],
+            # Generer avec le prompt stocke (sous semaphore)
+            async def do_generate_prompt():
+                return await asyncio.to_thread(
+                    tts_model.generate_voice_clone,
+                    text=text,
+                    language=lang_full,
+                    voice_clone_prompt=prompt_data["prompt_items"],
+                )
+
+            wavs, sr = await with_generation_lock(
+                do_generate_prompt(), timeout=90, endpoint="/clone"
             )
 
         # Mode 2: Traiter l'audio de reference a la volee
@@ -926,13 +998,18 @@ async def voice_clone(
             # Charger le modele Base (pas CustomVoice!)
             tts_model = load_clone_base_model(model)
 
-            # Generer l'audio clone
-            wavs, sr = await asyncio.to_thread(
-                tts_model.generate_voice_clone,
-                text=text,
-                language=lang_full,
-                ref_audio=tmp_path,
-                ref_text=reference_text,
+            # Generer l'audio clone (sous semaphore)
+            async def do_generate_ref():
+                return await asyncio.to_thread(
+                    tts_model.generate_voice_clone,
+                    text=text,
+                    language=lang_full,
+                    ref_audio=tmp_path,
+                    ref_text=reference_text,
+                )
+
+            wavs, sr = await with_generation_lock(
+                do_generate_ref(), timeout=90, endpoint="/clone"
             )
 
         # Sauvegarder en memoire
@@ -1024,11 +1101,16 @@ async def create_clone_prompt(
         # Charger le modele Base (pas CustomVoice!)
         tts_model = load_clone_base_model(model)
 
-        # Creer le prompt
-        prompt_items = await asyncio.to_thread(
-            tts_model.create_voice_clone_prompt,
-            ref_audio=tmp_path,
-            ref_text=reference_text,
+        # Creer le prompt (sous semaphore)
+        async def do_create_prompt():
+            return await asyncio.to_thread(
+                tts_model.create_voice_clone_prompt,
+                ref_audio=tmp_path,
+                ref_text=reference_text,
+            )
+
+        prompt_items = await with_generation_lock(
+            do_create_prompt(), timeout=60, endpoint="/clone/prompt"
         )
 
         # Nettoyer le fichier temporaire
@@ -1262,12 +1344,18 @@ async def create_custom_voice(
             if duration > 30:
                 raise HTTPException(status_code=400, detail=f"Audio trop long : {duration:.1f}s (max: 30s)")
 
-            # Charger le modèle et créer le prompt
+            # Charger le modèle et créer le prompt (sous semaphore)
             tts_model = load_clone_base_model(model)
-            prompt_items = await asyncio.to_thread(
-                tts_model.create_voice_clone_prompt,
-                ref_audio=tmp_path,
-                ref_text=reference_text,
+
+            async def do_clone_prompt():
+                return await asyncio.to_thread(
+                    tts_model.create_voice_clone_prompt,
+                    ref_audio=tmp_path,
+                    ref_text=reference_text,
+                )
+
+            prompt_items = await with_generation_lock(
+                do_clone_prompt(), timeout=120, endpoint="/voices/custom(clone)"
             )
 
         else:
@@ -1278,17 +1366,18 @@ async def create_custom_voice(
                     detail="voice_description est requis pour source=design"
                 )
 
-            # Charger le modèle Voice Design
-            tts_model = load_voice_design_model()
+            # Charger le modèle Voice Design (sous semaphore)
+            async def do_design_test():
+                tts_mdl = load_voice_design_model()
+                return await asyncio.to_thread(
+                    tts_mdl.generate_voice_design,
+                    text="Test de voix.",
+                    language=lang_full,
+                    instruct=voice_description,
+                )
 
-            # Générer un audio court pour extraire les embeddings
-            # Note: Voice Design ne crée pas de prompt réutilisable directement,
-            # on génère un échantillon et on stocke la description pour régénérer
-            wavs, sr = await asyncio.to_thread(
-                tts_model.generate_voice_design,
-                text="Test de voix.",
-                language=lang_full,
-                instruct=voice_description,
+            wavs, sr = await with_generation_lock(
+                do_design_test(), timeout=120, endpoint="/voices/custom(design)"
             )
 
             # Pour Voice Design, on stocke la description comme "prompt"
@@ -1426,50 +1515,45 @@ async def preset_voice(
 
     Retourne : fichier WAV
     """
-    try:
-        # Convertir code langue en nom complet
+    async def do_generate():
         language_full = LANGUAGE_MAP.get(language, "French")
 
-        # Vérifier si c'est une voix native
         if voice in PRESET_VOICES:
-            model = load_preset_voice_model()
+            mdl = load_preset_voice_model()
             wavs, sr = await asyncio.to_thread(
-                model.generate_custom_voice,
+                mdl.generate_custom_voice,
                 text=text,
                 language=language_full,
                 speaker=voice,
             )
 
-        # Vérifier si c'est une voix personnalisée
         elif voice in custom_voices:
             voice_data = custom_voices[voice]
             meta = voice_data["meta"]
-            prompt_items = get_custom_voice_prompt(voice)
+            pi = get_custom_voice_prompt(voice)
 
-            if prompt_items is None:
+            if pi is None:
                 raise HTTPException(
                     status_code=500,
                     detail=f"Impossible de charger les embeddings de la voix '{voice}'"
                 )
 
-            # Si c'est une voix design, régénérer avec la description
-            if meta.get("source") == "design" and isinstance(prompt_items, dict) and prompt_items.get("type") == "design":
+            if meta.get("source") == "design" and isinstance(pi, dict) and pi.get("type") == "design":
                 tts_model = load_voice_design_model()
                 wavs, sr = await asyncio.to_thread(
                     tts_model.generate_voice_design,
                     text=text,
                     language=language_full,
-                    instruct=prompt_items["voice_description"],
+                    instruct=pi["voice_description"],
                 )
             else:
-                # Voix clonée : utiliser le prompt
                 model_size = meta.get("model", "1.7B")
                 tts_model = load_clone_base_model(model_size)
                 wavs, sr = await asyncio.to_thread(
                     tts_model.generate_voice_clone,
                     text=text,
                     language=language_full,
-                    voice_clone_prompt=prompt_items,
+                    voice_clone_prompt=pi,
                 )
 
         else:
@@ -1479,11 +1563,15 @@ async def preset_voice(
                 detail=f"Voix '{voice}' inconnue. Disponibles : {', '.join(all_voices)}"
             )
 
-        # Sauvegarder en mémoire
         audio_buffer = io.BytesIO()
         sf.write(audio_buffer, wavs[0], sr, format="WAV")
         audio_buffer.seek(0)
+        return audio_buffer
 
+    try:
+        audio_buffer = await with_generation_lock(
+            do_generate(), timeout=60, endpoint="/preset"
+        )
         return StreamingResponse(
             audio_buffer,
             media_type="audio/wav",
@@ -1523,38 +1611,37 @@ async def preset_voice_with_instruct(
 
     Retourne : fichier WAV
     """
-    try:
-        # Vérifier que la voix existe (natives uniquement pour instruct)
-        if voice not in PRESET_VOICES:
-            if voice in custom_voices:
-                raise HTTPException(
-                    status_code=400,
-                    detail=f"La voix personnalisée '{voice}' ne supporte pas /preset/instruct. Utilisez /preset."
-                )
+    # Validation hors semaphore
+    if voice not in PRESET_VOICES:
+        if voice in custom_voices:
             raise HTTPException(
                 status_code=400,
-                detail=f"Voix '{voice}' inconnue. Disponibles : {', '.join(PRESET_VOICES.keys())}"
+                detail=f"La voix personnalisée '{voice}' ne supporte pas /preset/instruct. Utilisez /preset."
             )
+        raise HTTPException(
+            status_code=400,
+            detail=f"Voix '{voice}' inconnue. Disponibles : {', '.join(PRESET_VOICES.keys())}"
+        )
 
-        model = load_voice_clone_model()  # 1.7B-CustomVoice
-
-        # Convertir code langue en nom complet
+    async def do_generate():
+        mdl = load_voice_clone_model()  # 1.7B-CustomVoice
         language_full = LANGUAGE_MAP.get(language, "French")
-
-        # Générer l'audio avec instruction
         wavs, sr = await asyncio.to_thread(
-            model.generate_custom_voice,
+            mdl.generate_custom_voice,
             text=text,
             language=language_full,
             speaker=voice,
             instruct=instruct if instruct else "",
         )
-
-        # Sauvegarder en mémoire
         audio_buffer = io.BytesIO()
         sf.write(audio_buffer, wavs[0], sr, format="WAV")
         audio_buffer.seek(0)
+        return audio_buffer
 
+    try:
+        audio_buffer = await with_generation_lock(
+            do_generate(), timeout=60, endpoint="/preset/instruct"
+        )
         return StreamingResponse(
             audio_buffer,
             media_type="audio/wav",
@@ -1586,6 +1673,22 @@ async def models_status():
         "cuda_available": torch.cuda.is_available(),
         "models_dir": str(MODELS_DIR),
         "custom_voices_dir": str(CUSTOM_VOICES_DIR),
+    }
+
+
+@app.get("/generation/status", tags=["Monitoring"])
+async def generation_status():
+    """Etat du moteur de generation en temps reel."""
+    elapsed = None
+    if _generation_started_at:
+        elapsed = round(time.time() - _generation_started_at, 1)
+
+    return {
+        "busy": _generation_active,
+        "elapsed_seconds": elapsed,
+        "endpoint": _generation_endpoint,
+        "queue_timeout": GENERATION_QUEUE_TIMEOUT,
+        "generation_timeout": GENERATION_TIMEOUT,
     }
 
 
@@ -1686,65 +1789,64 @@ async def batch_preset_voice(request: BatchPresetRequest):
                 detail=f"Voix '{request.voice}' inconnue. Disponibles : {', '.join(all_voices)}"
             )
 
-        # Créer le ZIP en mémoire
-        zip_buffer = io.BytesIO()
+        async def do_batch():
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for i, text in enumerate(request.texts):
+                    if request.language == "auto":
+                        lang = resolve_language("auto", text)
+                    else:
+                        lang = language_full
 
-        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
-            for i, text in enumerate(request.texts):
-                # Résoudre la langue pour chaque texte si auto
-                if request.language == "auto":
-                    lang = resolve_language("auto", text)
-                else:
-                    lang = language_full
-
-                # Générer l'audio
-                if is_native:
-                    model = load_preset_voice_model()
-                    wavs, sr = await asyncio.to_thread(
-                        model.generate_custom_voice,
-                        text=text,
-                        language=lang,
-                        speaker=request.voice,
-                    )
-                else:
-                    # Voix personnalisée
-                    voice_data = custom_voices[request.voice]
-                    meta = voice_data["meta"]
-                    prompt_items = get_custom_voice_prompt(request.voice)
-
-                    if prompt_items is None:
-                        raise HTTPException(
-                            status_code=500,
-                            detail=f"Impossible de charger la voix '{request.voice}'"
-                        )
-
-                    if meta.get("source") == "design" and isinstance(prompt_items, dict) and prompt_items.get("type") == "design":
-                        tts_model = load_voice_design_model()
+                    if is_native:
+                        mdl = load_preset_voice_model()
                         wavs, sr = await asyncio.to_thread(
-                            tts_model.generate_voice_design,
+                            mdl.generate_custom_voice,
                             text=text,
                             language=lang,
-                            instruct=prompt_items["voice_description"],
+                            speaker=request.voice,
                         )
                     else:
-                        model_size = meta.get("model", "1.7B")
-                        tts_model = load_clone_base_model(model_size)
-                        wavs, sr = await asyncio.to_thread(
-                            tts_model.generate_voice_clone,
-                            text=text,
-                            language=lang,
-                            voice_clone_prompt=prompt_items,
-                        )
+                        voice_data = custom_voices[request.voice]
+                        meta = voice_data["meta"]
+                        pi = get_custom_voice_prompt(request.voice)
 
-                # Sauvegarder dans le ZIP
-                audio_buffer = io.BytesIO()
-                sf.write(audio_buffer, wavs[0], sr, format="WAV")
-                audio_buffer.seek(0)
+                        if pi is None:
+                            raise HTTPException(
+                                status_code=500,
+                                detail=f"Impossible de charger la voix '{request.voice}'"
+                            )
 
-                filename = f"{i+1:03d}.wav"
-                zf.writestr(filename, audio_buffer.getvalue())
+                        if meta.get("source") == "design" and isinstance(pi, dict) and pi.get("type") == "design":
+                            tts_model = load_voice_design_model()
+                            wavs, sr = await asyncio.to_thread(
+                                tts_model.generate_voice_design,
+                                text=text,
+                                language=lang,
+                                instruct=pi["voice_description"],
+                            )
+                        else:
+                            model_size = meta.get("model", "1.7B")
+                            tts_model = load_clone_base_model(model_size)
+                            wavs, sr = await asyncio.to_thread(
+                                tts_model.generate_voice_clone,
+                                text=text,
+                                language=lang,
+                                voice_clone_prompt=pi,
+                            )
 
-        zip_buffer.seek(0)
+                    audio_buffer = io.BytesIO()
+                    sf.write(audio_buffer, wavs[0], sr, format="WAV")
+                    audio_buffer.seek(0)
+                    zf.writestr(f"{i+1:03d}.wav", audio_buffer.getvalue())
+
+            zip_buffer.seek(0)
+            return zip_buffer
+
+        batch_timeout = min(len(request.texts) * 5 + 60, GENERATION_BATCH_TIMEOUT)
+        zip_buffer = await with_generation_lock(
+            do_batch(), timeout=batch_timeout, endpoint="/batch/preset"
+        )
 
         return StreamingResponse(
             zip_buffer,
@@ -1788,40 +1890,32 @@ async def batch_voice_design(request: BatchDesignRequest):
                     detail=f"Texte {i+1} est vide"
                 )
 
-        model = load_voice_design_model()
-
-        # Résoudre la langue (support auto)
         first_text = request.texts[0] if request.texts else ""
         language_full = resolve_language(request.language, first_text)
 
-        # Créer le ZIP en mémoire
-        zip_buffer = io.BytesIO()
+        async def do_batch():
+            mdl = load_voice_design_model()
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for i, text in enumerate(request.texts):
+                    lang = resolve_language("auto", text) if request.language == "auto" else language_full
+                    wavs, sr = await asyncio.to_thread(
+                        mdl.generate_voice_design,
+                        text=text,
+                        language=lang,
+                        instruct=request.voice_instruct or "Voix naturelle et claire",
+                    )
+                    audio_buffer = io.BytesIO()
+                    sf.write(audio_buffer, wavs[0], sr, format="WAV")
+                    audio_buffer.seek(0)
+                    zf.writestr(f"{i+1:03d}.wav", audio_buffer.getvalue())
+            zip_buffer.seek(0)
+            return zip_buffer
 
-        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
-            for i, text in enumerate(request.texts):
-                # Résoudre la langue pour chaque texte si auto
-                if request.language == "auto":
-                    lang = resolve_language("auto", text)
-                else:
-                    lang = language_full
-
-                # Générer l'audio
-                wavs, sr = await asyncio.to_thread(
-                    model.generate_voice_design,
-                    text=text,
-                    language=lang,
-                    instruct=request.voice_instruct or "Voix naturelle et claire",
-                )
-
-                # Sauvegarder dans le ZIP
-                audio_buffer = io.BytesIO()
-                sf.write(audio_buffer, wavs[0], sr, format="WAV")
-                audio_buffer.seek(0)
-
-                filename = f"{i+1:03d}.wav"
-                zf.writestr(filename, audio_buffer.getvalue())
-
-        zip_buffer.seek(0)
+        batch_timeout = min(len(request.texts) * 6 + 60, GENERATION_BATCH_TIMEOUT)
+        zip_buffer = await with_generation_lock(
+            do_batch(), timeout=batch_timeout, endpoint="/batch/design"
+        )
 
         return StreamingResponse(
             zip_buffer,
@@ -1879,40 +1973,32 @@ async def batch_voice_clone(
             )
 
         model_size = prompt_data["model"]
-        tts_model = load_clone_base_model(model_size)
-
-        # Résoudre la langue (support auto)
         first_text = text_list[0] if text_list else ""
         language_full = resolve_language(language, first_text)
 
-        # Créer le ZIP en mémoire
-        zip_buffer = io.BytesIO()
+        async def do_batch():
+            tts_model = load_clone_base_model(model_size)
+            zip_buffer = io.BytesIO()
+            with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
+                for i, text in enumerate(text_list):
+                    lang = resolve_language("auto", text) if language == "auto" else language_full
+                    wavs, sr = await asyncio.to_thread(
+                        tts_model.generate_voice_clone,
+                        text=text,
+                        language=lang,
+                        voice_clone_prompt=prompt_data["prompt_items"],
+                    )
+                    audio_buffer = io.BytesIO()
+                    sf.write(audio_buffer, wavs[0], sr, format="WAV")
+                    audio_buffer.seek(0)
+                    zf.writestr(f"{i+1:03d}.wav", audio_buffer.getvalue())
+            zip_buffer.seek(0)
+            return zip_buffer
 
-        with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
-            for i, text in enumerate(text_list):
-                # Résoudre la langue pour chaque texte si auto
-                if language == "auto":
-                    lang = resolve_language("auto", text)
-                else:
-                    lang = language_full
-
-                # Générer l'audio avec le prompt
-                wavs, sr = await asyncio.to_thread(
-                    tts_model.generate_voice_clone,
-                    text=text,
-                    language=lang,
-                    voice_clone_prompt=prompt_data["prompt_items"],
-                )
-
-                # Sauvegarder dans le ZIP
-                audio_buffer = io.BytesIO()
-                sf.write(audio_buffer, wavs[0], sr, format="WAV")
-                audio_buffer.seek(0)
-
-                filename = f"{i+1:03d}.wav"
-                zf.writestr(filename, audio_buffer.getvalue())
-
-        zip_buffer.seek(0)
+        batch_timeout = min(len(text_list) * 6 + 60, GENERATION_BATCH_TIMEOUT)
+        zip_buffer = await with_generation_lock(
+            do_batch(), timeout=batch_timeout, endpoint="/batch/clone"
+        )
 
         prompt_name = prompt_data.get("name", "clone")
         return StreamingResponse(
@@ -2026,56 +2112,56 @@ async def tokenizer_decode(request: DetokenizeRequest):
 
 @app.post("/mcp/preset", response_model=MCPAudioResponse, tags=["MCP Tools"])
 @limiter.limit(MCP_RATE_LIMIT)
-def mcp_preset_voice(request: Request, data: MCPPresetRequest):
+async def mcp_preset_voice(request: Request, data: MCPPresetRequest):
     """
     [MCP Tool] Génère un audio avec une voix préréglée.
 
     Retourne l'audio encodé en base64 pour compatibilité MCP.
     Limite: 2000 caractères max pour le texte.
     """
-    try:
-        # Résoudre la langue
+    async def do_generate():
         language_full = resolve_language(data.language, data.text)
 
-        # Vérifier si c'est une voix native
         if data.voice in PRESET_VOICES:
-            model = load_preset_voice_model()
-            wavs, sr = model.generate_custom_voice(
+            mdl = load_preset_voice_model()
+            wavs, sr = await asyncio.to_thread(
+                mdl.generate_custom_voice,
                 text=data.text,
                 language=language_full,
                 speaker=data.voice,
             )
-            model_used = "0.6B-CustomVoice"
+            m_used = "0.6B-CustomVoice"
 
-        # Vérifier si c'est une voix personnalisée
         elif data.voice in custom_voices:
             voice_data = custom_voices[data.voice]
             meta = voice_data["meta"]
-            prompt_items = get_custom_voice_prompt(data.voice)
+            pi = get_custom_voice_prompt(data.voice)
 
-            if prompt_items is None:
+            if pi is None:
                 raise HTTPException(
                     status_code=500,
                     detail={"error": f"Impossible de charger la voix '{data.voice}'", "code": "VOICE_LOAD_ERROR"}
                 )
 
-            if meta.get("source") == "design" and isinstance(prompt_items, dict) and prompt_items.get("type") == "design":
+            if meta.get("source") == "design" and isinstance(pi, dict) and pi.get("type") == "design":
                 tts_model = load_voice_design_model()
-                wavs, sr = tts_model.generate_voice_design(
+                wavs, sr = await asyncio.to_thread(
+                    tts_model.generate_voice_design,
                     text=data.text,
                     language=language_full,
-                    instruct=prompt_items["voice_description"],
+                    instruct=pi["voice_description"],
                 )
-                model_used = "1.7B-VoiceDesign"
+                m_used = "1.7B-VoiceDesign"
             else:
                 model_size = meta.get("model", "1.7B")
                 tts_model = load_clone_base_model(model_size)
-                wavs, sr = tts_model.generate_voice_clone(
+                wavs, sr = await asyncio.to_thread(
+                    tts_model.generate_voice_clone,
                     text=data.text,
                     language=language_full,
-                    voice_clone_prompt=prompt_items,
+                    voice_clone_prompt=pi,
                 )
-                model_used = f"{model_size}-Base"
+                m_used = f"{model_size}-Base"
         else:
             all_voices = list(PRESET_VOICES.keys()) + list(custom_voices.keys())
             raise HTTPException(
@@ -2087,17 +2173,21 @@ def mcp_preset_voice(request: Request, data: MCPPresetRequest):
                 }
             )
 
-        # Encoder en base64
         audio_buffer = io.BytesIO()
         sf.write(audio_buffer, wavs[0], sr, format="WAV")
         audio_buffer.seek(0)
         audio_b64 = base64.b64encode(audio_buffer.read()).decode('utf-8')
         duration_ms = int(len(wavs[0]) / sr * 1000)
+        return wavs, sr, audio_b64, duration_ms, m_used
 
+    try:
+        _, _, audio_b64, duration_ms, model_used = await with_generation_lock(
+            do_generate(), timeout=60, endpoint="/mcp/preset"
+        )
         return MCPAudioResponse(
             audio_base64=audio_b64,
             format="wav",
-            sample_rate=sr,
+            sample_rate=24000,
             duration_ms=duration_ms,
             voice_used=data.voice,
             model_used=model_used,
@@ -2111,29 +2201,32 @@ def mcp_preset_voice(request: Request, data: MCPPresetRequest):
 
 @app.post("/mcp/design", response_model=MCPAudioResponse, tags=["MCP Tools"])
 @limiter.limit(MCP_RATE_LIMIT)
-def mcp_voice_design(request: Request, data: MCPDesignRequest):
+async def mcp_voice_design(request: Request, data: MCPDesignRequest):
     """
     [MCP Tool] Génère un audio avec une voix décrite en langage naturel.
 
     Utilise le modèle 1.7B-VoiceDesign pour créer une voix à partir d'une description.
     """
-    try:
-        model = load_voice_design_model()
+    async def do_generate():
+        mdl = load_voice_design_model()
         language_full = resolve_language(data.language, data.text)
-
-        wavs, sr = model.generate_voice_design(
+        wavs, sr = await asyncio.to_thread(
+            mdl.generate_voice_design,
             text=data.text,
             language=language_full,
             instruct=data.voice_description,
         )
-
-        # Encoder en base64
         audio_buffer = io.BytesIO()
         sf.write(audio_buffer, wavs[0], sr, format="WAV")
         audio_buffer.seek(0)
         audio_b64 = base64.b64encode(audio_buffer.read()).decode('utf-8')
         duration_ms = int(len(wavs[0]) / sr * 1000)
+        return sr, audio_b64, duration_ms
 
+    try:
+        sr, audio_b64, duration_ms = await with_generation_lock(
+            do_generate(), timeout=90, endpoint="/mcp/design"
+        )
         return MCPAudioResponse(
             audio_base64=audio_b64,
             format="wav",
@@ -2143,13 +2236,15 @@ def mcp_voice_design(request: Request, data: MCPDesignRequest):
             model_used="1.7B-VoiceDesign",
         )
 
+    except HTTPException:
+        raise
     except Exception as e:
         raise HTTPException(status_code=500, detail={"error": str(e), "code": "GENERATION_ERROR"})
 
 
 @app.post("/mcp/clone", response_model=MCPAudioResponse, tags=["MCP Tools"])
 @limiter.limit(MCP_RATE_LIMIT)
-def mcp_voice_clone(request: Request, data: MCPCloneRequest):
+async def mcp_voice_clone(request: Request, data: MCPCloneRequest):
     """
     [MCP Tool] Génère un audio avec une voix clonée.
 
@@ -2158,35 +2253,39 @@ def mcp_voice_clone(request: Request, data: MCPCloneRequest):
     ⚠️ ATTENTION: Les prompts sont stockés en MÉMOIRE uniquement.
     Ils sont perdus au redémarrage du serveur.
     """
-    try:
-        prompt_data = get_prompt(data.prompt_id)
-        if not prompt_data:
-            raise HTTPException(
-                status_code=404,
-                detail={
-                    "error": f"Prompt '{data.prompt_id}' non trouvé",
-                    "code": "PROMPT_NOT_FOUND",
-                    "suggestion": "Les prompts sont volatils. Recréez-le via /mcp/clone/prompt"
-                }
-            )
+    prompt_data = get_prompt(data.prompt_id)
+    if not prompt_data:
+        raise HTTPException(
+            status_code=404,
+            detail={
+                "error": f"Prompt '{data.prompt_id}' non trouvé",
+                "code": "PROMPT_NOT_FOUND",
+                "suggestion": "Les prompts sont volatils. Recréez-le via /mcp/clone/prompt"
+            }
+        )
 
-        model_size = prompt_data["model"]
+    model_size = prompt_data["model"]
+
+    async def do_generate():
         tts_model = load_clone_base_model(model_size)
         language_full = resolve_language(data.language, data.text)
-
-        wavs, sr = tts_model.generate_voice_clone(
+        wavs, sr = await asyncio.to_thread(
+            tts_model.generate_voice_clone,
             text=data.text,
             language=language_full,
             voice_clone_prompt=prompt_data["prompt_items"],
         )
-
-        # Encoder en base64
         audio_buffer = io.BytesIO()
         sf.write(audio_buffer, wavs[0], sr, format="WAV")
         audio_buffer.seek(0)
         audio_b64 = base64.b64encode(audio_buffer.read()).decode('utf-8')
         duration_ms = int(len(wavs[0]) / sr * 1000)
+        return sr, audio_b64, duration_ms
 
+    try:
+        sr, audio_b64, duration_ms = await with_generation_lock(
+            do_generate(), timeout=90, endpoint="/mcp/clone"
+        )
         return MCPAudioResponse(
             audio_base64=audio_b64,
             format="wav",
@@ -2205,7 +2304,7 @@ def mcp_voice_clone(request: Request, data: MCPCloneRequest):
 
 @app.post("/mcp/clone/prompt", response_model=MCPPromptResponse, tags=["MCP Tools"])
 @limiter.limit(MCP_RATE_LIMIT)
-def mcp_create_clone_prompt(request: Request, data: MCPCreatePromptRequest):
+async def mcp_create_clone_prompt(request: Request, data: MCPCreatePromptRequest):
     """
     [MCP Tool] Crée un prompt réutilisable pour clonage vocal.
 
@@ -2246,11 +2345,17 @@ def mcp_create_clone_prompt(request: Request, data: MCPCreatePromptRequest):
         if duration > 30:
             raise HTTPException(status_code=422, detail={"error": f"Audio trop long: {duration:.1f}s (max: 30s)", "code": "AUDIO_TOO_LONG"})
 
-        # Créer le prompt
-        tts_model = load_clone_base_model(data.model)
-        prompt_items = tts_model.create_voice_clone_prompt(
-            ref_audio=tmp_path,
-            ref_text=data.reference_text,
+        # Créer le prompt (sous semaphore)
+        async def do_create_prompt():
+            tts_model = load_clone_base_model(data.model)
+            return await asyncio.to_thread(
+                tts_model.create_voice_clone_prompt,
+                ref_audio=tmp_path,
+                ref_text=data.reference_text,
+            )
+
+        prompt_items = await with_generation_lock(
+            do_create_prompt(), timeout=60, endpoint="/mcp/clone/prompt"
         )
 
         # Stocker le prompt
@@ -2275,41 +2380,44 @@ def mcp_create_clone_prompt(request: Request, data: MCPCreatePromptRequest):
 
 @app.post("/mcp/preset/instruct", response_model=MCPAudioResponse, tags=["MCP Tools"])
 @limiter.limit(MCP_RATE_LIMIT)
-def mcp_preset_instruct(request: Request, data: MCPPresetInstructRequest):
+async def mcp_preset_instruct(request: Request, data: MCPPresetInstructRequest):
     """
     [MCP Tool] Génère un audio avec contrôle émotionnel/style.
 
     Utilise le modèle 1.7B-CustomVoice pour un contrôle fin des émotions.
     Voix natives uniquement (Serena, Vivian, etc.).
     """
-    try:
-        if data.voice not in PRESET_VOICES:
-            raise HTTPException(
-                status_code=400,
-                detail={
-                    "error": f"Voix '{data.voice}' non supportée pour instruct",
-                    "code": "VOICE_NOT_SUPPORTED",
-                    "suggestion": f"Voix natives: {', '.join(PRESET_VOICES.keys())}"
-                }
-            )
+    if data.voice not in PRESET_VOICES:
+        raise HTTPException(
+            status_code=400,
+            detail={
+                "error": f"Voix '{data.voice}' non supportée pour instruct",
+                "code": "VOICE_NOT_SUPPORTED",
+                "suggestion": f"Voix natives: {', '.join(PRESET_VOICES.keys())}"
+            }
+        )
 
-        model = load_voice_clone_model()  # 1.7B-CustomVoice
+    async def do_generate():
+        mdl = load_voice_clone_model()  # 1.7B-CustomVoice
         language_full = resolve_language(data.language, data.text)
-
-        wavs, sr = model.generate_custom_voice(
+        wavs, sr = await asyncio.to_thread(
+            mdl.generate_custom_voice,
             text=data.text,
             language=language_full,
             speaker=data.voice,
             instruct=data.instruct if data.instruct else "",
         )
-
-        # Encoder en base64
         audio_buffer = io.BytesIO()
         sf.write(audio_buffer, wavs[0], sr, format="WAV")
         audio_buffer.seek(0)
         audio_b64 = base64.b64encode(audio_buffer.read()).decode('utf-8')
         duration_ms = int(len(wavs[0]) / sr * 1000)
+        return sr, audio_b64, duration_ms
 
+    try:
+        sr, audio_b64, duration_ms = await with_generation_lock(
+            do_generate(), timeout=60, endpoint="/mcp/preset/instruct"
+        )
         return MCPAudioResponse(
             audio_base64=audio_b64,
             format="wav",
