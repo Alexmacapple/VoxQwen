@@ -91,15 +91,15 @@ custom_voices: Dict[str, Dict[str, Any]] = {}
 
 # Voix prereglees du modele 0.6B-CustomVoice
 PRESET_VOICES = {
-    "Vivian": {"gender": "Femme", "native_lang": "Chinois", "description": "Voix feminine jeune, vive et legerement incisive"},
-    "Serena": {"gender": "Femme", "native_lang": "Chinois", "description": "Voix feminine jeune, chaleureuse et douce"},
-    "Uncle_Fu": {"gender": "Homme", "native_lang": "Chinois", "description": "Voix masculine mature avec un timbre grave et veloute"},
-    "Dylan": {"gender": "Homme", "native_lang": "Chinois (Pekin)", "description": "Voix masculine jeune de Pekin, claire et naturelle"},
-    "Eric": {"gender": "Homme", "native_lang": "Chinois (Sichuan)", "description": "Voix masculine enjouee de Chengdu, legerement rauque"},
+    "Vivian": {"gender": "Femme", "native_lang": "Chinois", "description": "Voix féminine jeune, vive et légèrement incisive"},
+    "Serena": {"gender": "Femme", "native_lang": "Chinois", "description": "Voix féminine jeune, chaleureuse et douce"},
+    "Uncle_Fu": {"gender": "Homme", "native_lang": "Chinois", "description": "Voix masculine mature avec un timbre grave et velouté"},
+    "Dylan": {"gender": "Homme", "native_lang": "Chinois (Pékin)", "description": "Voix masculine jeune de Pékin, claire et naturelle"},
+    "Eric": {"gender": "Homme", "native_lang": "Chinois (Sichuan)", "description": "Voix masculine enjouée de Chengdu, légèrement rauque"},
     "Ryan": {"gender": "Homme", "native_lang": "Anglais", "description": "Voix masculine dynamique avec un rythme soutenu"},
-    "Aiden": {"gender": "Homme", "native_lang": "Anglais", "description": "Voix masculine americaine ensoleillee avec des mediums clairs"},
-    "Ono_Anna": {"gender": "Femme", "native_lang": "Japonais", "description": "Voix feminine espiegle avec un timbre leger et agile"},
-    "Sohee": {"gender": "Femme", "native_lang": "Coreen", "description": "Voix feminine chaleureuse avec une riche emotion"},
+    "Aiden": {"gender": "Homme", "native_lang": "Anglais", "description": "Voix masculine américaine ensoleillée avec des médiums clairs"},
+    "Ono_Anna": {"gender": "Femme", "native_lang": "Japonais", "description": "Voix féminine espiègle avec un timbre léger et agile"},
+    "Sohee": {"gender": "Femme", "native_lang": "Coréen", "description": "Voix féminine chaleureuse avec une riche émotion"},
 }
 
 app = FastAPI(
@@ -1380,6 +1380,25 @@ async def delete_custom_voice_route(name: str):
     return {
         "status": "deleted",
         "name": name,
+    }
+
+
+@app.post("/voices/reload", tags=["Synthèse vocale"])
+async def reload_custom_voices_route():
+    """
+    Recharge les voix personnalisées depuis le disque.
+
+    Rescanne le dossier voices/custom/ et met à jour le registre en mémoire.
+    Utile après un renommage ou une modification externe des fichiers de voix.
+
+    Retourne :
+    - status : "reloaded"
+    - count : Nombre de voix chargées
+    """
+    load_custom_voices()
+    return {
+        "status": "reloaded",
+        "count": len(custom_voices),
     }
 
 
