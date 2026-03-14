@@ -101,6 +101,12 @@ _generation_lock = asyncio.Semaphore(1)
 _generation_active = False
 _generation_started_at: float | None = None
 _generation_endpoint: str | None = None
+_generation_stats = {
+    "total": 0,
+    "completed": 0,
+    "timeouts": 0,
+    "rejected_503": 0,
+}
 
 logger = logging.getLogger("voxqwen")
 
@@ -123,15 +129,19 @@ async def with_generation_lock(coro, timeout: int | None = None, endpoint: str =
             timeout=GENERATION_QUEUE_TIMEOUT
         )
     except asyncio.TimeoutError:
+        _generation_stats["rejected_503"] += 1
+        logger.warning(f"TTS generation REJECTED (503): endpoint={endpoint}")
         raise HTTPException(
             status_code=503,
             detail="Moteur TTS occupe. Reessayez dans quelques secondes."
         )
 
     # 2. Execution avec timeout
+    _generation_stats["total"] += 1
     _generation_active = True
     _generation_started_at = time.time()
     _generation_endpoint = endpoint
+    logger.info(f"TTS generation start: endpoint={endpoint}, timeout={t}s")
     try:
         result = await asyncio.wait_for(coro, timeout=t)
         # 3. Nettoyage memoire GPU UNIQUEMENT apres succes
@@ -141,10 +151,14 @@ async def with_generation_lock(coro, timeout: int | None = None, endpoint: str =
                 torch.mps.empty_cache()
         except Exception:
             pass
+        _generation_stats["completed"] += 1
+        elapsed = time.time() - _generation_started_at if _generation_started_at else 0
+        logger.info(f"TTS generation end: endpoint={endpoint}, elapsed={elapsed:.1f}s")
         return result
     except asyncio.TimeoutError:
         # PAS de empty_cache() ici : le thread orphelin utilise encore MPS
-        logger.error(f"Generation timeout ({t}s) sur {endpoint}")
+        _generation_stats["timeouts"] += 1
+        logger.error(f"TTS generation TIMEOUT: endpoint={endpoint}, timeout={t}s")
         raise HTTPException(
             status_code=504,
             detail=f"Generation interrompue (timeout {t}s)."
@@ -1689,6 +1703,7 @@ async def generation_status():
         "endpoint": _generation_endpoint,
         "queue_timeout": GENERATION_QUEUE_TIMEOUT,
         "generation_timeout": GENERATION_TIMEOUT,
+        "stats": dict(_generation_stats),
     }
 
 
