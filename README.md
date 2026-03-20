@@ -26,6 +26,7 @@ API locale de synthèse vocale basée sur Qwen3-TTS (Alibaba), optimisée pour M
 | `POST /tokenizer/decode` | Décoder tokens en texte | - |
 | `GET /models/status` | Statut des modèles chargés | - |
 | `POST /models/preload` | Pré-charger les modèles | - |
+| `GET /generation/status` | Génération active, stats, elapsed | - |
 | `GET /mcp/docs` | Documentation MCP interactive | - |
 
 ## Installation Rapide
@@ -189,12 +190,56 @@ Français, Anglais, Chinois, Japonais, Coréen, Allemand, Russe, Portugais, Espa
 | http://localhost:8060/openapi.json | Schéma OpenAPI 3.1 |
 | http://localhost:8060/mcp/docs | Documentation MCP pour Claude Code |
 
+## Architecture
+
+### Vue d'ensemble
+
+VoxQwen est une API FastAPI monolithique (`main.py`, ~2900 lignes) qui charge les modeles Qwen3-TTS en memoire GPU et expose des routes de synthese vocale.
+
+```
+Client (VoxStudio ou curl)
+    │
+    ▼
+FastAPI (:8060)
+    │
+    ├── Semaphore GPU (1 generation a la fois)
+    │   ├── Timeout queue : 5s → 503 si GPU occupe
+    │   └── Timeout execution : 120s → 504 si generation trop longue
+    │
+    ├── Modeles Qwen3-TTS (chargement lazy, ~18 Go)
+    │   ├── 0.6B-CustomVoice → /preset (rapide)
+    │   ├── 1.7B-CustomVoice → /preset/instruct (emotionnel)
+    │   ├── 1.7B-VoiceDesign → /design (creation voix)
+    │   └── 1.7B-Base / 0.6B-Base → /clone (clonage)
+    │
+    └── Voix custom persistantes (voices/custom/)
+        ├── meta.json (metadonnees)
+        └── prompt.pt (embedding PyTorch ~1.4 Ko)
+```
+
+### Concurrence GPU
+
+Un seul appel TTS a la fois (semaphore `asyncio.Semaphore(1)`). Les requetes en attente recoivent une reponse 503 apres 5 secondes. Les generations qui depassent 120 secondes sont interrompues avec un 504.
+
+Le monitoring est accessible via :
+- `GET /models/status` — modeles charges, voix custom, prompts en cache
+- `GET /generation/status` — generation active, stats (total, completed, timeouts, rejected)
+
+### Chargement des modeles
+
+Les modeles sont charges en memoire GPU au premier appel (lazy loading). Chaque modele occupe 2-4 Go de VRAM. Le pre-chargement est possible via `POST /models/preload`.
+
+### Voix personnalisees
+
+Les voix creees via `/voices/custom` sont persistees sur disque (`voices/custom/{name}/`). Au demarrage, toutes les voix sont rechargees automatiquement. L'embedding vocal (`prompt.pt`) est charge en memoire a la premiere utilisation.
+
 ## Configuration Technique
 
 - **Python** : 3.12
 - **Device** : MPS (Apple Silicon) / CUDA / CPU
 - **PyTorch** : 2.1+
 - **Port API** : 8060
+- **Modeles** : ~18 Go sur disque, 2-4 Go VRAM par modele
 
 ## Ressources
 
