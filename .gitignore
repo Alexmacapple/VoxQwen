@@ -13,6 +13,9 @@ outputs/
 *.flac
 *.ogg
 
+# Voix custom persistantes (embeddings + meta, runtime)
+voices/
+
 # Python
 __pycache__/
 *.py[cod]
