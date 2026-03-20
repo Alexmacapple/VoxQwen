@@ -10,6 +10,7 @@ Usage:
     # API sur http://localhost:8060
 """
 
+import gc
 import os
 import io
 import re
@@ -21,6 +22,7 @@ import asyncio
 import logging
 import time
 import zipfile
+from contextlib import asynccontextmanager
 from datetime import datetime
 from pathlib import Path
 from typing import Optional, Dict, Any, List
@@ -58,6 +60,9 @@ API_VERSION = "1.4.0"
 
 # Rate Limiting Configuration
 MCP_RATE_LIMIT = os.getenv("VOXQWEN_RATE_LIMIT", "10/minute")
+TTS_RATE_LIMIT = os.getenv("VOXQWEN_TTS_RATE_LIMIT", "10/minute")
+BATCH_RATE_LIMIT = os.getenv("VOXQWEN_BATCH_RATE_LIMIT", "2/minute")
+CLONE_RATE_LIMIT = os.getenv("VOXQWEN_CLONE_RATE_LIMIT", "5/minute")
 limiter = Limiter(key_func=get_remote_address)
 
 # MCP Server (initialisé après app)
@@ -96,7 +101,11 @@ custom_voices: Dict[str, Dict[str, Any]] = {}
 GENERATION_TIMEOUT = int(os.getenv("VOXQWEN_GENERATION_TIMEOUT", "120"))
 GENERATION_QUEUE_TIMEOUT = int(os.getenv("VOXQWEN_QUEUE_TIMEOUT", "5"))
 GENERATION_BATCH_TIMEOUT = int(os.getenv("VOXQWEN_BATCH_TIMEOUT", "600"))
+GPU_CLEANUP_DELAY = int(os.getenv("VOXQWEN_GPU_CLEANUP_DELAY", "30"))
+MAX_CLONE_PROMPTS = int(os.getenv("VOXQWEN_MAX_PROMPTS", "100"))
+PROMPT_TTL_HOURS = int(os.getenv("VOXQWEN_PROMPT_TTL_HOURS", "24"))
 
+_gpu_cleanup_scheduled = False
 _generation_lock = asyncio.Semaphore(1)
 _generation_active = False
 _generation_started_at: float | None = None
@@ -110,6 +119,49 @@ _generation_stats = {
 
 logger = logging.getLogger("voxqwen")
 logger.setLevel(logging.INFO)
+
+
+def _try_empty_gpu_cache():
+    """Tente de vider le cache GPU (safe, ignore les erreurs)."""
+    try:
+        if torch.backends.mps.is_available():
+            torch.mps.empty_cache()
+        elif torch.cuda.is_available():
+            torch.cuda.empty_cache()
+    except Exception:
+        pass
+
+
+def _deferred_gpu_cleanup(endpoint: str):
+    """Nettoie la VRAM GPU apres un timeout."""
+    global _gpu_cleanup_scheduled
+    try:
+        _try_empty_gpu_cache()
+        gc.collect()
+        logger.info(f"GPU cleanup differe OK (post-timeout {endpoint})")
+    except Exception as e:
+        logger.warning(f"GPU cleanup differe echoue: {e}")
+    finally:
+        _gpu_cleanup_scheduled = False
+
+
+def _get_gpu_memory_info() -> dict:
+    """Retourne les infos memoire GPU si disponibles."""
+    info = {"device": DEVICE, "available": False}
+    try:
+        if DEVICE == "mps":
+            if hasattr(torch.mps, "current_allocated_memory"):
+                info["allocated_mb"] = round(torch.mps.current_allocated_memory() / 1024 / 1024, 1)
+                info["available"] = True
+            if hasattr(torch.mps, "driver_allocated_memory"):
+                info["driver_allocated_mb"] = round(torch.mps.driver_allocated_memory() / 1024 / 1024, 1)
+        elif DEVICE.startswith("cuda"):
+            info["allocated_mb"] = round(torch.cuda.memory_allocated() / 1024 / 1024, 1)
+            info["reserved_mb"] = round(torch.cuda.memory_reserved() / 1024 / 1024, 1)
+            info["available"] = True
+    except Exception:
+        pass
+    return info
 
 
 async def with_generation_lock(coro, timeout: int | None = None, endpoint: str = ""):
@@ -157,9 +209,15 @@ async def with_generation_lock(coro, timeout: int | None = None, endpoint: str =
         logger.info(f"TTS generation end: endpoint={endpoint}, elapsed={elapsed:.1f}s")
         return result
     except asyncio.TimeoutError:
-        # PAS de empty_cache() ici : le thread orphelin utilise encore MPS
         _generation_stats["timeouts"] += 1
         logger.error(f"TTS generation TIMEOUT: endpoint={endpoint}, timeout={t}s")
+        # Deferred GPU cleanup
+        global _gpu_cleanup_scheduled
+        if not _gpu_cleanup_scheduled:
+            _gpu_cleanup_scheduled = True
+            loop = asyncio.get_running_loop()
+            loop.call_later(GPU_CLEANUP_DELAY, _deferred_gpu_cleanup, endpoint)
+            logger.info(f"GPU cleanup planifie dans {GPU_CLEANUP_DELAY}s")
         raise HTTPException(
             status_code=504,
             detail=f"Generation interrompue (timeout {t}s)."
@@ -183,6 +241,35 @@ PRESET_VOICES = {
     "Ono_Anna": {"gender": "Femme", "native_lang": "Japonais", "description": "Voix féminine espiègle avec un timbre léger et agile"},
     "Sohee": {"gender": "Femme", "native_lang": "Coréen", "description": "Voix féminine chaleureuse avec une riche émotion"},
 }
+
+@asynccontextmanager
+async def lifespan(app_instance: FastAPI):
+    """Startup et shutdown de l'application."""
+    load_custom_voices()
+    logger.info(f"VoxQwen v{API_VERSION} | device={DEVICE} | voix_custom={len(custom_voices)}")
+    yield
+    logger.info("Arret en cours...")
+    if _generation_active:
+        logger.warning("Generation en cours, attente max 30s...")
+        for _ in range(30):
+            await asyncio.sleep(1)
+            if not _generation_active:
+                logger.info("Generation terminee, arret propre")
+                break
+        else:
+            logger.warning("Timeout attente generation, arret force")
+    # Cleanup GPU
+    global voice_design_model, voice_clone_model, preset_voice_model
+    global clone_model_1_7b, clone_model_0_6b
+    voice_design_model = None
+    voice_clone_model = None
+    preset_voice_model = None
+    clone_model_1_7b = None
+    clone_model_0_6b = None
+    _try_empty_gpu_cache()
+    gc.collect()
+    logger.info("GPU cleanup termine")
+
 
 app = FastAPI(
     title="Qwen3-TTS API",
@@ -221,6 +308,7 @@ Français, Anglais, Chinois, Japonais, Coréen, Allemand, Russe, Portugais, Espa
 Pour l'intégration avec Claude Code via MCP, consultez [/mcp/docs](/mcp/docs).
 """,
     version=API_VERSION,
+    lifespan=lifespan,
     docs_url="/docs",
     redoc_url="/redoc",
     openapi_url="/openapi.json",
@@ -444,10 +532,7 @@ def load_voice_design_model():
     """Charge le modele Voice Design."""
     global voice_design_model
     if voice_design_model is None:
-        print("=" * 60)
-        print("Chargement du modele Voice Design...")
-        print("Cela peut prendre quelques minutes au premier lancement.")
-        print("=" * 60)
+        logger.info("Chargement Voice Design...")
 
         from qwen_tts import Qwen3TTSModel
 
@@ -460,7 +545,7 @@ def load_voice_design_model():
             device_map=DEVICE,
             dtype=torch.float16,  # bfloat16 pas supporte sur MPS
         )
-        print(f"Modele Voice Design charge sur {DEVICE}")
+        logger.info(f"Voice Design charge ({DEVICE})")
     return voice_design_model
 
 
@@ -468,10 +553,7 @@ def load_voice_clone_model():
     """Charge le modele Voice Clone."""
     global voice_clone_model
     if voice_clone_model is None:
-        print("=" * 60)
-        print("Chargement du modele Voice Clone...")
-        print("Cela peut prendre quelques minutes au premier lancement.")
-        print("=" * 60)
+        logger.info("Chargement Voice Clone...")
 
         from qwen_tts import Qwen3TTSModel
 
@@ -483,7 +565,7 @@ def load_voice_clone_model():
             device_map=DEVICE,
             dtype=torch.float16,
         )
-        print(f"Modele Voice Clone charge sur {DEVICE}")
+        logger.info(f"Voice Clone charge ({DEVICE})")
     return voice_clone_model
 
 
@@ -491,10 +573,7 @@ def load_preset_voice_model():
     """Charge le modele Preset Voice (0.6B-CustomVoice)."""
     global preset_voice_model
     if preset_voice_model is None:
-        print("=" * 60)
-        print("Chargement du modele Preset Voice...")
-        print("Cela peut prendre quelques minutes au premier lancement.")
-        print("=" * 60)
+        logger.info("Chargement Preset Voice...")
 
         from qwen_tts import Qwen3TTSModel
 
@@ -505,7 +584,7 @@ def load_preset_voice_model():
             device_map=DEVICE,
             dtype=torch.float32,  # float32 pour MPS (float16 cause des NaN avec ce modele)
         )
-        print(f"Modele Preset Voice charge sur {DEVICE}")
+        logger.info(f"Preset Voice charge ({DEVICE})")
     return preset_voice_model
 
 
@@ -525,10 +604,7 @@ def load_clone_base_model(model_size: str = "1.7B"):
 
     if model_size == "1.7B":
         if clone_model_1_7b is None:
-            print("=" * 60)
-            print("Chargement du modele 1.7B-Base pour clonage...")
-            print("Cela peut prendre quelques minutes au premier lancement.")
-            print("=" * 60)
+            logger.info("Chargement 1.7B-Base...")
 
             from qwen_tts import Qwen3TTSModel
 
@@ -538,15 +614,12 @@ def load_clone_base_model(model_size: str = "1.7B"):
                 device_map=DEVICE,
                 dtype=torch.float16,
             )
-            print(f"Modele 1.7B-Base charge sur {DEVICE}")
+            logger.info(f"1.7B-Base charge ({DEVICE})")
         return clone_model_1_7b
 
     elif model_size == "0.6B":
         if clone_model_0_6b is None:
-            print("=" * 60)
-            print("Chargement du modele 0.6B-Base pour clonage...")
-            print("Cela peut prendre quelques minutes au premier lancement.")
-            print("=" * 60)
+            logger.info("Chargement 0.6B-Base...")
 
             from qwen_tts import Qwen3TTSModel
 
@@ -556,7 +629,7 @@ def load_clone_base_model(model_size: str = "1.7B"):
                 device_map=DEVICE,
                 dtype=torch.float32,  # float32 pour MPS avec modele 0.6B
             )
-            print(f"Modele 0.6B-Base charge sur {DEVICE}")
+            logger.info(f"0.6B-Base charge ({DEVICE})")
         return clone_model_0_6b
 
     else:
@@ -566,6 +639,33 @@ def load_clone_base_model(model_size: str = "1.7B"):
 # ==============================================================================
 # PROMPT STORAGE HELPERS
 # ==============================================================================
+
+def _cleanup_expired_prompts():
+    """Supprime les prompts expires (> TTL)."""
+    now = datetime.now()
+    cutoff = PROMPT_TTL_HOURS * 3600
+    expired = [pid for pid, data in voice_clone_prompts.items()
+               if (now - data["created_at"]).total_seconds() > cutoff]
+    for pid in expired:
+        del voice_clone_prompts[pid]
+    if expired:
+        gc.collect()
+        _try_empty_gpu_cache()
+        logger.info(f"{len(expired)} prompt(s) expire(s) supprime(s)")
+
+
+def _enforce_prompt_limit():
+    """Supprime les prompts les plus anciens si la limite est depassee."""
+    removed = 0
+    while len(voice_clone_prompts) > MAX_CLONE_PROMPTS:
+        oldest = min(voice_clone_prompts, key=lambda k: voice_clone_prompts[k]["created_at"])
+        del voice_clone_prompts[oldest]
+        removed += 1
+    if removed:
+        gc.collect()
+        _try_empty_gpu_cache()
+        logger.info(f"{removed} prompt(s) evince(s) (limite {MAX_CLONE_PROMPTS})")
+
 
 def store_prompt(prompt_items: Any, model: str, name: Optional[str] = None) -> str:
     """
@@ -589,6 +689,8 @@ def store_prompt(prompt_items: Any, model: str, name: Optional[str] = None) -> s
         "name": name,
         "created_at": datetime.now(),
     }
+    _cleanup_expired_prompts()
+    _enforce_prompt_limit()
     return prompt_id
 
 
@@ -617,6 +719,8 @@ def delete_prompt(prompt_id: str) -> bool:
     """
     if prompt_id in voice_clone_prompts:
         del voice_clone_prompts[prompt_id]
+        gc.collect()
+        _try_empty_gpu_cache()
         return True
     return False
 
@@ -700,7 +804,7 @@ def load_custom_voices():
                 "prompt_items": None,  # Lazy loading
             }
         except Exception as e:
-            print(f"Erreur chargement voix {voice_dir.name}: {e}")
+            logger.error(f"Erreur chargement voix {voice_dir.name}: {e}")
 
 
 def get_custom_voice_prompt(name: str):
@@ -725,7 +829,7 @@ def get_custom_voice_prompt(name: str):
             try:
                 voice_data["prompt_items"] = torch.load(prompt_file, map_location=DEVICE, weights_only=False)
             except Exception as e:
-                print(f"Erreur chargement embeddings {name}: {e}")
+                logger.error(f"Erreur chargement embeddings {name}: {e}")
                 return None
 
     return voice_data["prompt_items"]
@@ -799,6 +903,8 @@ def delete_custom_voice(name: str) -> bool:
         shutil.rmtree(voice_dir)
 
     del custom_voices[name]
+    gc.collect()
+    _try_empty_gpu_cache()
     return True
 
 
@@ -864,7 +970,8 @@ async def list_languages():
 
 
 @app.post("/design", tags=["Synthèse vocale"])
-async def voice_design(request: DesignRequest):
+@limiter.limit(TTS_RATE_LIMIT)
+async def voice_design(request: Request, data: DesignRequest):
     """
     Voice Design - Génère un audio avec une voix décrite en texte.
 
@@ -877,12 +984,12 @@ async def voice_design(request: DesignRequest):
     """
     async def do_generate():
         model = load_voice_design_model()
-        language = LANGUAGE_MAP.get(request.language, "French")
+        language = LANGUAGE_MAP.get(data.language, "French")
         wavs, sr = await asyncio.to_thread(
             model.generate_voice_design,
-            text=request.text,
+            text=data.text,
             language=language,
-            instruct=request.voice_instruct or "Voix naturelle et claire",
+            instruct=data.voice_instruct or "Voix naturelle et claire",
         )
         audio_buffer = io.BytesIO()
         sf.write(audio_buffer, wavs[0], sr, format="WAV")
@@ -908,7 +1015,9 @@ async def voice_design(request: DesignRequest):
 
 
 @app.post("/clone", tags=["Synthèse vocale"])
+@limiter.limit(CLONE_RATE_LIMIT)
 async def voice_clone(
+    request: Request,
     text: str = Form(..., description="Texte à synthétiser"),
     reference_audio: Optional[UploadFile] = File(None, description="Audio de référence (1-30 sec). Requis si pas de prompt_id."),
     reference_text: str = Form("", description="Transcription de l'audio de référence (REQUIS pour le clonage)"),
@@ -1050,7 +1159,9 @@ async def voice_clone(
 
 
 @app.post("/clone/prompt", tags=["Synthèse vocale"])
+@limiter.limit(CLONE_RATE_LIMIT)
 async def create_clone_prompt(
+    request: Request,
     reference_audio: UploadFile = File(..., description="Audio de référence (1-30 sec)"),
     reference_text: str = Form(..., description="Transcription de l'audio de référence (REQUIS)"),
     model: str = Form("1.7B", description="Modèle : '1.7B' (qualité) ou '0.6B' (rapide)"),
@@ -1264,7 +1375,9 @@ async def list_voices():
 
 
 @app.post("/voices/custom", tags=["Synthèse vocale"])
+@limiter.limit(CLONE_RATE_LIMIT)
 async def create_custom_voice(
+    request: Request,
     name: str = Form(..., description="Nom unique de la voix (3-50 chars, alphanum + tirets)"),
     source: str = Form(..., description="Source : 'clone' ou 'design'"),
     description: str = Form("", description="Description de la voix (max 200 chars)"),
@@ -1514,7 +1627,9 @@ async def reload_custom_voices_route():
 
 
 @app.post("/preset", tags=["Synthèse vocale"])
+@limiter.limit(TTS_RATE_LIMIT)
 async def preset_voice(
+    request: Request,
     text: str = Form(..., min_length=1, max_length=10000, description="Texte à synthétiser"),
     voice: str = Form("Serena", description="Nom de la voix (native ou personnalisée)"),
     language: str = Form("fr", description="Langue : fr, en, zh, ja, ko, de, ru, pt, es, it")
@@ -1602,7 +1717,9 @@ async def preset_voice(
 
 
 @app.post("/preset/instruct", tags=["Synthèse vocale"])
+@limiter.limit(TTS_RATE_LIMIT)
 async def preset_voice_with_instruct(
+    request: Request,
     text: str = Form(..., min_length=1, max_length=10000, description="Texte à synthétiser"),
     voice: str = Form("Serena", description="Nom de la voix (native uniquement pour instruct)"),
     instruct: str = Form("", description="Instruction pour contrôler l'émotion/style (ex : 'Ton joyeux et excité', 'Chuchotant doucement')"),
@@ -1688,6 +1805,7 @@ async def models_status():
         "cuda_available": torch.cuda.is_available(),
         "models_dir": str(MODELS_DIR),
         "custom_voices_dir": str(CUSTOM_VOICES_DIR),
+        "gpu_memory": _get_gpu_memory_info(),
     }
 
 
@@ -1705,6 +1823,7 @@ async def generation_status():
         "queue_timeout": GENERATION_QUEUE_TIMEOUT,
         "generation_timeout": GENERATION_TIMEOUT,
         "stats": dict(_generation_stats),
+        "gpu_memory": _get_gpu_memory_info(),
     }
 
 
@@ -1763,7 +1882,8 @@ async def preload_models(
 # ==============================================================================
 
 @app.post("/batch/preset", tags=["Batch Processing"])
-async def batch_preset_voice(request: BatchPresetRequest):
+@limiter.limit(BATCH_RATE_LIMIT)
+async def batch_preset_voice(request: Request, data: BatchPresetRequest):
     """
     Batch Preset - Génère plusieurs audios avec la même voix.
 
@@ -1776,14 +1896,14 @@ async def batch_preset_voice(request: BatchPresetRequest):
     """
     try:
         # Valider le nombre de textes
-        if len(request.texts) > 100:
+        if len(data.texts) > 100:
             raise HTTPException(
                 status_code=400,
                 detail="Maximum 100 textes par requête"
             )
 
         # Vérifier que tous les textes sont non vides
-        for i, text in enumerate(request.texts):
+        for i, text in enumerate(data.texts):
             if not text or not text.strip():
                 raise HTTPException(
                     status_code=400,
@@ -1791,25 +1911,25 @@ async def batch_preset_voice(request: BatchPresetRequest):
                 )
 
         # Résoudre la langue (support auto)
-        first_text = request.texts[0] if request.texts else ""
-        language_full = resolve_language(request.language, first_text)
+        first_text = data.texts[0] if data.texts else ""
+        language_full = resolve_language(data.language, first_text)
 
         # Vérifier si c'est une voix native ou custom
-        is_native = request.voice in PRESET_VOICES
-        is_custom = request.voice in custom_voices
+        is_native = data.voice in PRESET_VOICES
+        is_custom = data.voice in custom_voices
 
         if not is_native and not is_custom:
             all_voices = list(PRESET_VOICES.keys()) + list(custom_voices.keys())
             raise HTTPException(
                 status_code=400,
-                detail=f"Voix '{request.voice}' inconnue. Disponibles : {', '.join(all_voices)}"
+                detail=f"Voix '{data.voice}' inconnue. Disponibles : {', '.join(all_voices)}"
             )
 
         async def do_batch():
             zip_buffer = io.BytesIO()
             with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
-                for i, text in enumerate(request.texts):
-                    if request.language == "auto":
+                for i, text in enumerate(data.texts):
+                    if data.language == "auto":
                         lang = resolve_language("auto", text)
                     else:
                         lang = language_full
@@ -1820,17 +1940,17 @@ async def batch_preset_voice(request: BatchPresetRequest):
                             mdl.generate_custom_voice,
                             text=text,
                             language=lang,
-                            speaker=request.voice,
+                            speaker=data.voice,
                         )
                     else:
-                        voice_data = custom_voices[request.voice]
+                        voice_data = custom_voices[data.voice]
                         meta = voice_data["meta"]
-                        pi = get_custom_voice_prompt(request.voice)
+                        pi = get_custom_voice_prompt(data.voice)
 
                         if pi is None:
                             raise HTTPException(
                                 status_code=500,
-                                detail=f"Impossible de charger la voix '{request.voice}'"
+                                detail=f"Impossible de charger la voix '{data.voice}'"
                             )
 
                         if meta.get("source") == "design" and isinstance(pi, dict) and pi.get("type") == "design":
@@ -1859,7 +1979,7 @@ async def batch_preset_voice(request: BatchPresetRequest):
             zip_buffer.seek(0)
             return zip_buffer
 
-        batch_timeout = min(len(request.texts) * 60 + 60, GENERATION_BATCH_TIMEOUT)
+        batch_timeout = min(len(data.texts) * 60 + 60, GENERATION_BATCH_TIMEOUT)
         zip_buffer = await with_generation_lock(
             do_batch(), timeout=batch_timeout, endpoint="/batch/preset"
         )
@@ -1868,7 +1988,7 @@ async def batch_preset_voice(request: BatchPresetRequest):
             zip_buffer,
             media_type="application/zip",
             headers={
-                "Content-Disposition": f"attachment; filename=batch_preset_{request.voice.lower()}.zip"
+                "Content-Disposition": f"attachment; filename=batch_preset_{data.voice.lower()}.zip"
             }
         )
 
@@ -1879,7 +1999,8 @@ async def batch_preset_voice(request: BatchPresetRequest):
 
 
 @app.post("/batch/design", tags=["Batch Processing"])
-async def batch_voice_design(request: BatchDesignRequest):
+@limiter.limit(BATCH_RATE_LIMIT)
+async def batch_voice_design(request: Request, data: BatchDesignRequest):
     """
     Batch Voice Design - Génère plusieurs audios avec une voix décrite en texte.
 
@@ -1892,34 +2013,34 @@ async def batch_voice_design(request: BatchDesignRequest):
     """
     try:
         # Valider le nombre de textes
-        if len(request.texts) > 100:
+        if len(data.texts) > 100:
             raise HTTPException(
                 status_code=400,
                 detail="Maximum 100 textes par requête"
             )
 
         # Vérifier que tous les textes sont non vides
-        for i, text in enumerate(request.texts):
+        for i, text in enumerate(data.texts):
             if not text or not text.strip():
                 raise HTTPException(
                     status_code=400,
                     detail=f"Texte {i+1} est vide"
                 )
 
-        first_text = request.texts[0] if request.texts else ""
-        language_full = resolve_language(request.language, first_text)
+        first_text = data.texts[0] if data.texts else ""
+        language_full = resolve_language(data.language, first_text)
 
         async def do_batch():
             mdl = load_voice_design_model()
             zip_buffer = io.BytesIO()
             with zipfile.ZipFile(zip_buffer, 'w', zipfile.ZIP_DEFLATED) as zf:
-                for i, text in enumerate(request.texts):
-                    lang = resolve_language("auto", text) if request.language == "auto" else language_full
+                for i, text in enumerate(data.texts):
+                    lang = resolve_language("auto", text) if data.language == "auto" else language_full
                     wavs, sr = await asyncio.to_thread(
                         mdl.generate_voice_design,
                         text=text,
                         language=lang,
-                        instruct=request.voice_instruct or "Voix naturelle et claire",
+                        instruct=data.voice_instruct or "Voix naturelle et claire",
                     )
                     audio_buffer = io.BytesIO()
                     sf.write(audio_buffer, wavs[0], sr, format="WAV")
@@ -1928,7 +2049,7 @@ async def batch_voice_design(request: BatchDesignRequest):
             zip_buffer.seek(0)
             return zip_buffer
 
-        batch_timeout = min(len(request.texts) * 60 + 60, GENERATION_BATCH_TIMEOUT)
+        batch_timeout = min(len(data.texts) * 60 + 60, GENERATION_BATCH_TIMEOUT)
         zip_buffer = await with_generation_lock(
             do_batch(), timeout=batch_timeout, endpoint="/batch/design"
         )
@@ -1948,7 +2069,9 @@ async def batch_voice_design(request: BatchDesignRequest):
 
 
 @app.post("/batch/clone", tags=["Batch Processing"])
+@limiter.limit(CLONE_RATE_LIMIT)
 async def batch_voice_clone(
+    request: Request,
     texts: str = Form(..., description="Textes à synthétiser, séparés par des sauts de ligne (\\n)"),
     prompt_id: str = Form(..., description="ID du prompt créé via /clone/prompt (requis)"),
     language: str = Form("fr", description="Langue : fr, en, zh, ja, ko, de, ru, pt, es, it, auto"),
@@ -2513,8 +2636,8 @@ def get_mcp_tools_from_server() -> list:
                 "parameters": tool.inputSchema if hasattr(tool, 'inputSchema') else {},
                 "category": categorize_tool(tool.name),
             })
-    except Exception:
-        pass
+    except Exception as e:
+        logger.warning(f"Erreur introspection MCP: {e}")
     return tools
 
 
@@ -2833,44 +2956,6 @@ mcp_server.mount()
 if __name__ == "__main__":
     import uvicorn
 
-    # Charger les voix personnalisées au démarrage
-    load_custom_voices()
-    custom_count = len(custom_voices)
-
-    langdetect_status = "Oui" if langdetect_available else "Non (pip install langdetect)"
-
-    print(f"""
-    ╔══════════════════════════════════════════════════════════╗
-    ║                     TTS-ALEX v{API_VERSION}                      ║
-    ║          API locale Qwen3-TTS pour Mac Studio            ║
-    ╠══════════════════════════════════════════════════════════╣
-    ║  Appareil : {DEVICE:<44} ║
-    ║  MPS disponible : {str(torch.backends.mps.is_available()):<38} ║
-    ║  CUDA disponible : {str(torch.cuda.is_available()):<37} ║
-    ║  Voix natives : 9                                        ║
-    ║  Voix personnalisées : {custom_count:<33} ║
-    ║  Auto-détection langue : {langdetect_status:<30} ║
-    ║  MCP Server : Actif                                      ║
-    ╠══════════════════════════════════════════════════════════╣
-    ║  Routes REST :                                           ║
-    ║    POST /preset           - Synthèse avec voix           ║
-    ║    POST /preset/instruct  - Voix + émotions (1.7B)       ║
-    ║    POST /design           - Voice Design                 ║
-    ║    POST /clone            - Voice Clone                  ║
-    ║    POST /clone/prompt     - Créer prompt réutilisable    ║
-    ╠══════════════════════════════════════════════════════════╣
-    ║  Routes MCP (v1.4) :                                     ║
-    ║    POST /mcp/preset       - TTS avec voix (JSON+base64)  ║
-    ║    POST /mcp/design       - Voice Design (JSON+base64)   ║
-    ║    POST /mcp/clone        - Voice Clone (JSON+base64)    ║
-    ║    GET  /mcp/voices       - Liste des voix               ║
-    ║    GET  /mcp/status       - Statut serveur MCP           ║
-    ╠══════════════════════════════════════════════════════════╣
-    ║  Documentation :                                         ║
-    ║    http://localhost:8060/docs      - Swagger UI          ║
-    ║    http://localhost:8060/mcp/docs  - MCP Documentation   ║
-    ║    http://localhost:8060/mcp       - Endpoint MCP        ║
-    ╚══════════════════════════════════════════════════════════╝
-    """)
+    logger.info(f"VoxQwen v{API_VERSION} | device={DEVICE} | docs=http://localhost:8060/docs")
 
     uvicorn.run(app, host="0.0.0.0", port=8060)
