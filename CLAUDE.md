@@ -54,7 +54,35 @@ python models/download_models.py --model 1.7B-VoiceDesign  # Modèle spécifique
 
 ## Architecture
 
-### Routes API (main.py)
+### Structure du code
+
+```
+VoxQwen/
+├── main.py              # Assembleur (~162 lignes) : lifespan, app, MCP, uvicorn
+├── config.py            # Configuration, constants, device, mappings, logging, rate limiting
+├── schemas.py           # 15 classes Pydantic (zero dependance)
+├── models.py            # 5 chargeurs de modeles lazy, cleanup GPU
+├── voices.py            # Voix natives + custom + prompts volatils, persistence
+├── generation.py        # Semaphore GPU, with_generation_lock, stats
+├── routers/
+│   ├── __init__.py      # register_all(app)
+│   ├── health.py        # GET /, /health, /languages
+│   ├── synthesis.py     # POST /preset, /preset/instruct, /design
+│   ├── clone.py         # POST /clone, /clone/prompt, GET/DELETE prompts
+│   ├── voice_management.py  # GET/POST/DELETE /voices, /voices/custom
+│   ├── batch.py         # POST /batch/preset, /batch/design, /batch/clone
+│   ├── admin.py         # GET /models/status, /generation/status, POST /models/preload
+│   ├── tokenizer.py     # POST /tokenizer/encode, /tokenizer/decode
+│   └── mcp_routes.py    # 9 routes /mcp/* + helpers documentation
+├── Documentation/       # 5 guides techniques
+├── PRD/                 # 6 PRD (voix persistantes, MCP, clone, safety, observabilite, refactoring)
+├── Test/                # 25 tests REST (pytest) + 11 tests MCP (urllib)
+├── models/              # Modeles Qwen3-TTS ~18 Go (gitignored)
+├── voices/              # Voix custom (gitignored)
+└── logs/                # Logs rotation JSON (gitignored)
+```
+
+### Routes API
 | Route | Méthode | Description | Modèle |
 |-------|---------|-------------|--------|
 | `/` | GET | État du serveur | - |
@@ -70,8 +98,11 @@ python models/download_models.py --model 1.7B-VoiceDesign  # Modèle spécifique
 | `/clone/prompt` | POST | Créer un prompt réutilisable pour clonage | 1.7B-Base / 0.6B-Base |
 | `/clone/prompts` | GET | Lister les prompts en cache | - |
 | `/clone/prompts/{id}` | DELETE | Supprimer un prompt | - |
-| `/models/status` | GET | Statut des modèles et voix | - |
-| `/models/preload` | POST | Pré-charger les modèles | - |
+| `/models/status` | GET | Statut des modeles, GPU memory | - |
+| `/models/preload` | POST | Pre-charger les modeles | - |
+| `/generation/status` | GET | Generation active, stats, GPU memory | - |
+| `/health` | GET | Probe de sante (200/503) | - |
+| `/voices/reload` | POST | Recharger les voix custom depuis disque | - |
 | `/batch/preset` | POST | Batch preset voice (retourne ZIP) | Variable |
 | `/batch/design` | POST | Batch voice design (retourne ZIP) | 1.7B-VoiceDesign |
 | `/batch/clone` | POST | Batch voice clone (retourne ZIP) | 1.7B-Base / 0.6B-Base |
@@ -190,23 +221,25 @@ Permet d'encoder/décoder du texte en tokens via le tokenizer de Qwen3-TTS.
 - `POST /tokenizer/encode` : `{"text": "Bonjour"}` → `{"tokens": [...], "count": N}`
 - `POST /tokenizer/decode` : `{"tokens": [...]}` → `{"text": "...", "count": N}`
 
-### Patterns Clés
+### Patterns cles
 
-**Détection du Device** (à préserver) :
-```python
-if torch.backends.mps.is_available():
-    DEVICE = "mps"
-elif torch.cuda.is_available():
-    DEVICE = "cuda:0"
-else:
-    DEVICE = "cpu"
-```
+**Architecture modulaire** : Le code est decoupe en modules (`config.py`, `models.py`, `voices.py`, `generation.py`) + 8 routeurs. `main.py` est un assembleur de ~162 lignes. Les routeurs importent depuis les modules, pas d'imports circulaires.
 
-**Chargement des Modèles** : Chargement paresseux - les modèles sont chargés au premier appel de route, stockés comme globales au niveau du module. Utilise `torch.float16` (bfloat16 non supporté sur MPS).
+**Concurrence GPU** : Un seul appel TTS a la fois via `asyncio.Semaphore(1)` dans `generation.py`. Timeout queue 5s (503), timeout generation 120s (504). Cleanup GPU differe 30s apres timeout.
 
-**Mapping des Langues** : Utiliser le dict `LANGUAGE_MAP` pour convertir les codes (fr, en, zh, etc.) en noms complets (French, English, Chinese) comme requis par Qwen3-TTS.
+**Rate limiting** : `@limiter.limit()` sur toutes les routes TTS (10/min preset/design, 5/min clone, 2/min batch). Configurable via env vars `VOXQWEN_TTS_RATE_LIMIT`, `VOXQWEN_BATCH_RATE_LIMIT`, `VOXQWEN_CLONE_RATE_LIMIT`.
 
-**Traitement Audio** : L'audio de référence doit faire 1-30 secondes. Toujours nettoyer les fichiers temporaires avec `os.unlink()` dans les blocs finally. Sortie en WAV via StreamingResponse.
+**Chargement lazy** : Les modeles sont charges au premier appel (dans `models.py`). `torch.float16` pour les modeles 1.7B, `torch.float32` pour les 0.6B (MPS).
+
+**Lifespan** : Startup = chargement voix custom. Shutdown = attente generation en cours (max 30s) + decharge modeles + `empty_cache()` + `gc.collect()`.
+
+**Logging** : `RotatingFileHandler` JSON dans `logs/voxqwen.log` (10 Mo x 5). Console en format lisible. Logger = `logging.getLogger("voxqwen")`.
+
+**Cache prompts** : TTL 24h, limite 100 prompts max. Eviction automatique dans `store_prompt()`.
+
+**MCP** : `FastApiMCP(app)` cree dans `main.py` APRES `register_all(app)`. Routes MCP accedent a `mcp_server` et `templates` via `app.state`.
+
+**Traitement Audio** : L'audio de reference doit faire 1-30 secondes. Toujours nettoyer les fichiers temporaires avec `os.unlink()` dans les blocs finally. Sortie en WAV via StreamingResponse.
 
 ## Langues Supportées
 
@@ -227,11 +260,17 @@ L'API génère automatiquement une documentation interactive conforme OpenAPI 3.
 ## Stack Technique
 
 - Python 3.12
-- FastAPI + Uvicorn (port 8060)
-- fastapi-mcp (intégration MCP pour Claude Code)
-- slowapi (rate limiting)
-- PyTorch avec accélération MPS
+- FastAPI + Uvicorn (port 8060), 8 routeurs, 39 routes
+- fastapi-mcp (integration MCP pour Claude Code)
+- slowapi (rate limiting sur toutes routes TTS)
+- PyTorch avec acceleration MPS (Apple Silicon)
 - qwen-tts (depuis GitHub)
 - soundfile, librosa, torchaudio pour le traitement audio
 - torchcodec (requis pour les routes /clone et /clone/prompt)
-- langdetect (optionnel, pour la détection automatique de langue)
+- langdetect (optionnel, pour la detection automatique de langue)
+
+## Tests
+
+- **Tests REST** : `python -m pytest Test/test_rest_endpoints.py -v` (25 tests, sans GPU)
+- **Tests MCP** : `python Test/test_mcp_integration.py` (serveur live requis, 11 tests)
+- **Lock file** : `requirements-lock.txt` (versions exactes pour deploiement)
