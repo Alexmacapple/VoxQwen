@@ -50,9 +50,6 @@ python models/download_models.py              # Tous les modèles
 python models/download_models.py --list       # Lister les disponibles
 python models/download_models.py --model 1.7B-VoiceDesign  # Modèle spécifique
 
-# Lancer les démos
-python demo_basique_voix_prereglees.py        # Voix préréglées basiques
-python demo_avancee_conception_clonage.py     # Conception/clonage avancé
 ```
 
 ## Architecture
