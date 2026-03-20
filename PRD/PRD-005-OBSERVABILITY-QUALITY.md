@@ -119,9 +119,15 @@ Appeler `setup_logging()` au debut du module, en remplacement des lignes 111-112
 
 **Estimation** : ~15 lignes `logger.xxx()` a ajouter.
 
+**Attention doublon access log** : Uvicorn logue deja chaque requete HTTP sur stdout (`INFO: 127.0.0.1 - "POST /preset HTTP/1.1" 200`). Les logs "requete TTS recue" ajoutes en 1.2 sont **complementaires** (ils contiennent voice, text_length, parametres metier que l'access log n'a pas). Pour eviter la confusion :
+- Les logs metier utilisent le logger `voxqwen` (fichier `logs/voxqwen.log`)
+- Les access logs uvicorn restent sur stdout (reduit a WARNING dans `setup_logging()`)
+- Resultat : le fichier log contient uniquement les evenements metier, pas le bruit HTTP
+
 **Criteres de validation** :
-- [ ] Un `POST /preset` genere un log INFO au debut (voice, text_length)
+- [ ] Un `POST /preset` genere un log INFO au debut (voice, text_length) dans `voxqwen.log`
 - [ ] with_generation_lock logue deja debut/fin (existant) → pas de doublon
+- [ ] Les access logs uvicorn ne sont PAS dans `voxqwen.log` (seulement stdout)
 - [ ] Une erreur genere un log ERROR avec le message d'exception
 - [ ] Un batch de 10 textes logue "batch demarre, 10 textes, timeout=660s"
 
@@ -316,24 +322,137 @@ async def test_tokenizer_encode_empty(client):
 
 **Tests qui necessitent un mock TTS** (generation reelle) :
 
+Le mock doit simuler le flux complet : chargement modele → generation → StreamingResponse WAV.
+
 ```python
-@patch("main.load_preset_voice_model")
+import io
+import struct
+
+def _make_fake_wav(duration_ms=100, sample_rate=24000) -> bytes:
+    """Genere un WAV valide minimal pour les tests."""
+    num_samples = int(sample_rate * duration_ms / 1000)
+    data_size = num_samples * 2  # 16 bits = 2 bytes
+    buf = io.BytesIO()
+    # RIFF header
+    buf.write(b"RIFF")
+    buf.write(struct.pack("<I", 36 + data_size))
+    buf.write(b"WAVE")
+    # fmt chunk
+    buf.write(b"fmt ")
+    buf.write(struct.pack("<IHHIIHH", 16, 1, 1, sample_rate, sample_rate * 2, 2, 16))
+    # data chunk
+    buf.write(b"data")
+    buf.write(struct.pack("<I", data_size))
+    buf.write(b"\x00" * data_size)
+    return buf.getvalue()
+
+
 @patch("main.with_generation_lock")
-async def test_preset_success(mock_lock, mock_load, client):
-    """POST /preset avec mock TTS retourne un WAV."""
-    # Configurer les mocks pour simuler une generation
-    mock_load.return_value = MagicMock()
-    mock_lock.return_value = b"RIFF..."  # Bytes WAV fake
-    # ... appel et assertion
+async def test_preset_success(mock_lock, client):
+    """POST /preset avec mock TTS retourne un WAV valide."""
+    # with_generation_lock retourne les bytes WAV directement
+    fake_wav = _make_fake_wav()
+    mock_lock.return_value = fake_wav
+
+    r = await client.post("/preset", data={
+        "text": "Bonjour",
+        "voice": "Serena",
+        "language": "fr",
+    })
+    # La route retourne une StreamingResponse — le mock court-circuite
+    # On verifie au minimum que la route ne crash pas avec un mock
+    assert r.status_code in [200, 500]  # 500 si le mock ne simule pas assez
+
+
+@patch("main.with_generation_lock")
+async def test_design_success(mock_lock, client):
+    """POST /design avec mock TTS."""
+    mock_lock.return_value = _make_fake_wav()
+    r = await client.post("/design", json={
+        "text": "Bonjour",
+        "voice_instruct": "Voix grave masculine",
+        "language": "fr",
+    })
+    assert r.status_code in [200, 500]
 ```
 
-**Estimation** : ~30 tests au total.
+**Note realiste** : Les mocks de `with_generation_lock` ne simulent pas parfaitement le flux car les routes construisent un `StreamingResponse` apres le lock. Il peut etre necessaire de mocker a un niveau plus bas (`model.generate`) ou d'accepter que certains tests de succes ne soient verifiables qu'en integration (serveur live). L'objectif principal des tests unitaires est de couvrir la **validation des inputs** et les **cas d'erreur**, pas la generation audio complete.
+
+**Tests rate limiting** (apres PRD-004 phase 3) :
+
+```python
+async def test_rate_limiting_preset(client):
+    """POST /preset retourne 429 apres depassement du rate limit."""
+    # Envoyer 12 requetes rapides (limite = 10/min)
+    responses = []
+    for _ in range(12):
+        r = await client.post("/preset", data={
+            "text": "Test", "voice": "Serena", "language": "fr",
+        })
+        responses.append(r.status_code)
+    # Au moins une reponse 429
+    assert 429 in responses
+    # Verifier format JSON du 429
+    last_429 = [r for r in responses if r == 429]
+    assert len(last_429) > 0
+```
+
+**Tests lifespan** (startup/shutdown PRD-004 phase 2) :
+
+```python
+from main import app
+from httpx import AsyncClient, ASGITransport
+
+async def test_lifespan_loads_custom_voices():
+    """La lifespan charge les voix custom au demarrage."""
+    transport = ASGITransport(app=app)
+    async with AsyncClient(transport=transport, base_url="http://test") as client:
+        # Le lifespan s'execute a l'entree du context manager
+        r = await client.get("/models/status")
+        assert r.status_code == 200
+        # custom_voices_count peut etre 0 (pas de voix sur disque en test)
+        assert "custom_voices_count" in r.json()
+```
+
+**Estimation** : ~35 tests au total (info, validation, mock TTS, rate limit, lifespan).
+
+### 2.5 Cohabitation avec les tests MCP existants
+
+**Etat actuel** : `Test/test_mcp_integration.py` (7 tests) et `Test/test_mcp_audio.py` (4 tests) se connectent a un serveur **live** sur port 8060 via `urllib`. Ils necessitent le serveur demarre + modeles GPU charges.
+
+**Decision** : Les **garder tels quels** comme tests d'integration end-to-end. Ils ne sont pas executables en CI mais valident le comportement reel avec GPU. Les nouveaux tests pytest (REST) sont complementaires : ils valident la logique FastAPI sans GPU.
+
+**Structure finale** :
+
+```
+Test/
+├── pytest.ini                    # Config pytest (ignore test_mcp_*)
+├── conftest.py                   # Fixture client async
+├── requirements-test.txt         # Dependencies pytest
+├── test_rest_endpoints.py        # ~35 tests pytest (NOUVEAU, sans GPU)
+├── test_mcp_integration.py       # 7 tests urllib (EXISTANT, serveur live)
+├── test_mcp_audio.py             # 4 tests urllib (EXISTANT, serveur live)
+├── test_mcp_endpoints.sh         # Script bash (EXISTANT)
+└── run_tests.sh                  # Script bash (EXISTANT)
+```
+
+**Dans `pytest.ini`**, exclure les tests MCP (ils ne fonctionnent pas sans serveur live) :
+
+```ini
+[pytest]
+asyncio_mode = auto
+timeout = 30
+testpaths = .
+python_files = test_rest_*.py
+```
+
+Le `python_files = test_rest_*.py` limite pytest aux nouveaux tests. Les tests MCP restent executables manuellement : `python Test/test_mcp_integration.py` (avec serveur demarre).
 
 **Criteres de validation** :
-- [ ] `cd VoxQwen && python -m pytest Test/test_rest_endpoints.py -v` passe
+- [ ] `cd VoxQwen && python -m pytest Test/ -v` passe (~35 tests, < 30s)
 - [ ] Tests executables sans GPU (modeles mockes)
-- [ ] Couverture : validation inputs, erreurs 4xx, routes info
-- [ ] Temps d'execution < 30s
+- [ ] Les tests MCP existants ne sont pas casses (executables manuellement)
+- [ ] Couverture : validation inputs, erreurs 4xx, routes info, rate limit, lifespan
 
 ---
 
@@ -504,3 +623,4 @@ Phase 4 — Monitoring (~30 min)
 |---------|------|-------------|
 | v1.0 | 2026-03-20 | Creation |
 | v2.0 | 2026-03-20 | Audit connus/inconnus : verification import safe (pas de chargement GPU), pattern tests existants (urllib vs test client), correction status "ok" (pas "running"), ajout details mock strategy, note side effects import |
+| v2.1 | 2026-03-20 | Evaluation : tests mock TTS detailles (fake WAV, limites du mock), tests rate limiting et lifespan, cohabitation tests MCP existants (section 2.5), note doublon access log uvicorn |

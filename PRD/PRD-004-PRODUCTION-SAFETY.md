@@ -69,9 +69,14 @@ Supprimer les bannieres decoratives (`═══`, `║`). Un simple `logger.info
 **Solution** :
 
 ```python
-# Nouvelle fonction
+GPU_CLEANUP_DELAY = int(os.getenv("VOXQWEN_GPU_CLEANUP_DELAY", "30"))
+
+# Flag pour eviter de planifier plusieurs cleanups simultanement
+_gpu_cleanup_scheduled = False
+
 def _deferred_gpu_cleanup(endpoint: str):
     """Nettoie la VRAM GPU apres un timeout (thread orphelin probablement termine)."""
+    global _gpu_cleanup_scheduled
     try:
         if torch.backends.mps.is_available():
             torch.mps.empty_cache()
@@ -82,6 +87,8 @@ def _deferred_gpu_cleanup(endpoint: str):
         logger.info(f"GPU cleanup differe OK (post-timeout {endpoint})")
     except Exception as e:
         logger.warning(f"GPU cleanup differe echoue: {e}")
+    finally:
+        _gpu_cleanup_scheduled = False
 ```
 
 ```python
@@ -90,9 +97,14 @@ except asyncio.TimeoutError:
     _generation_stats["timeouts"] += 1
     logger.error(f"TTS generation TIMEOUT: endpoint={endpoint}, timeout={t}s")
 
-    # Cleanup differe : 30s apres le timeout, le thread devrait etre termine
-    loop = asyncio.get_running_loop()
-    loop.call_later(30.0, _deferred_gpu_cleanup, endpoint)
+    # Cleanup differe : GPU_CLEANUP_DELAY secondes apres le timeout
+    # Deduplication : si un cleanup est deja planifie, ne pas en ajouter un deuxieme
+    global _gpu_cleanup_scheduled
+    if not _gpu_cleanup_scheduled:
+        _gpu_cleanup_scheduled = True
+        loop = asyncio.get_running_loop()
+        loop.call_later(GPU_CLEANUP_DELAY, _deferred_gpu_cleanup, endpoint)
+        logger.info(f"GPU cleanup planifie dans {GPU_CLEANUP_DELAY}s")
 
     raise HTTPException(
         status_code=504,
@@ -102,7 +114,13 @@ except asyncio.TimeoutError:
 
 **Note technique** : `loop.call_later()` avec une fonction synchrone fonctionne car la fonction s'execute dans le thread de l'event loop (pas dans un thread separe). `torch.mps.empty_cache()` est une operation rapide qui ne bloque pas significativement.
 
-**Risque residuel** : Si le thread orphelin n'a pas termine apres 30s (generation tres longue sur un gros texte), le `empty_cache()` pourrait confliter. Mitigation : le try/except autour de `empty_cache()` protege contre le crash. Au pire, le cache n'est pas vide — il le sera au prochain appel reussi (ligne 152).
+**Deduplication** : Si 3 timeouts arrivent en 30s, un seul cleanup est planifie (flag `_gpu_cleanup_scheduled`). Le flag est remis a `False` dans le `finally` du cleanup, permettant un nouveau cleanup si un nouveau timeout survient apres.
+
+**Delai configurable** : `VOXQWEN_GPU_CLEANUP_DELAY` (defaut 30s). Augmenter si les generations sont regulierement longues (ex: batch de 50+ textes).
+
+**Risque residuel** : Si le thread orphelin n'a pas termine apres le delai, le `empty_cache()` pourrait confliter. Mitigation : le try/except protege contre le crash. Au pire, le cache n'est pas vide — il le sera au prochain appel reussi (ligne 152).
+
+**Verification manuelle VRAM** : Apres un timeout, appeler `GET /generation/status` et verifier `gpu_memory.allocated_mb`. La valeur devrait baisser apres le cleanup differe. Sur macOS, `sudo powermetrics --samplers gpu_power -i 1000 -n 1` donne aussi la consommation GPU en temps reel.
 
 **Criteres de validation** :
 - [ ] Apres un timeout TTS force (texte de 10000 mots, timeout 5s), le log "GPU cleanup differe OK" apparait ~30s plus tard
@@ -374,7 +392,22 @@ async def preset_voice(
     # ... code inchange
 ```
 
-**Note CORS** : VoxQwen n'a pas de `CORSMiddleware`. slowapi utilise `get_remote_address` qui lit l'IP client. En usage local (VoxStudio sur localhost), tous les appels viennent de `127.0.0.1` → le rate limit s'applique globalement, pas par utilisateur. C'est acceptable pour un usage solo/equipe restreinte. Si multi-utilisateurs derriere un proxy, il faudra ajouter un `key_func` custom qui lit `X-Forwarded-For`.
+**Note CORS / Rate limit sur localhost** : VoxQwen n'a pas de `CORSMiddleware`. slowapi utilise `get_remote_address` qui lit l'IP client. En usage local (VoxStudio sur localhost), tous les appels viennent de `127.0.0.1` → le rate limit s'applique **globalement a tous les utilisateurs confondus**, pas par session.
+
+**Consequence** : Si 3 utilisateurs VoxStudio appellent `/preset` en parallele via Tailscale, le compteur rate limit est partage (3 appels = 3/10 pour tout le monde). C'est acceptable pour un usage solo ou equipe restreinte (< 5 users).
+
+**Si multi-utilisateurs** : Remplacer `key_func=get_remote_address` par un key_func qui lit `X-Thread-Id` (header session VoxStudio) :
+
+```python
+def _rate_limit_key(request: Request) -> str:
+    """Rate limit par session VoxStudio (X-Thread-Id) ou par IP."""
+    thread_id = request.headers.get("X-Thread-Id")
+    if thread_id:
+        return thread_id
+    return get_remote_address(request)
+```
+
+Ce changement est optionnel pour la v1 (usage solo). A implementer si congestion constatee.
 
 **Criteres de validation** :
 - [ ] `POST /preset` retourne 429 apres 10 appels rapides
@@ -513,3 +546,4 @@ Phase 4 — Cache prompts (~30 min)
 |---------|------|-------------|
 | v1.0 | 2026-03-20 | Creation |
 | v2.0 | 2026-03-20 | Audit connus/inconnus : ajout cleanup suppression voix/prompts (1.3), correction API MPS (`hasattr`), verification `Request` param manquant sur 9 routes, note CORS/rate limit, note race condition `_generation_active`, harmonisation created_at |
+| v2.1 | 2026-03-20 | Evaluation : delai cleanup configurable (env var), deduplication call_later, procedure verification VRAM (`powermetrics`), solution rate limit multi-user (`X-Thread-Id`) |

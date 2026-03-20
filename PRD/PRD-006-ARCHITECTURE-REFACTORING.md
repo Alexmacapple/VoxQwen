@@ -84,11 +84,21 @@ VoxQwen/
 
 Lignes actuelles : 50-76, 96-98, 175-185, 372-398, plus les nouvelles constantes PRD-004
 
+**Objets transversaux** : 3 objets ne rentrent dans aucun module metier. Voici leur placement :
+
+| Objet | Placement | Justification |
+|-------|-----------|---------------|
+| `limiter` (slowapi) | `config.py` | C'est une configuration (rate limits). Les routeurs importent `from config import limiter`. `app.state.limiter = limiter` reste dans `main.py` |
+| `setup_logging()` | `config.py` | C'est de l'initialisation. Appelee au debut de `main.py` : `logger = setup_logging()` |
+| `langdetect_available` + try/import | `config.py` | C'est de la detection de capacite, comme `DEVICE`. Utilisee par `generation.py:detect_language()` via `from config import langdetect_available` |
+
 ```python
 # config.py — Tout ce qui est constant ou configurable
 from pathlib import Path
 import os
 import torch
+import logging
+from logging.handlers import RotatingFileHandler
 
 # Paths
 MODELS_DIR = Path(__file__).parent / "models"
@@ -125,6 +135,27 @@ PROMPT_TTL_HOURS = int(os.getenv("VOXQWEN_PROMPT_TTL_HOURS", "24"))
 
 # Voix prereglees
 PRESET_VOICES = { "Vivian": {...}, "Serena": {...}, ... }
+
+# Detection langue (lazy import)
+langdetect_available = False
+try:
+    from langdetect import detect as langdetect_detect
+    langdetect_available = True
+except ImportError:
+    pass
+
+# Rate limiter (partage avec les routeurs)
+from slowapi import Limiter
+from slowapi.util import get_remote_address
+limiter = Limiter(key_func=get_remote_address)
+
+# Logging
+def setup_logging():
+    """Configure le logging avec rotation fichier + console."""
+    log_dir = Path(__file__).parent / "logs"
+    log_dir.mkdir(exist_ok=True)
+    # ... (voir PRD-005 phase 1.1 pour le code complet)
+    return logging.getLogger("voxqwen")
 
 # Langues
 LANGUAGE_MAP = { "fr": "French", "en": "English", ... }
@@ -323,6 +354,19 @@ if __name__ == "__main__":
 
 ---
 
+## Compatibilite tests
+
+Les tests PRD-005 utilisent `from main import app`. Apres refactoring, ce chemin **reste valide** car `main.py` contient toujours `app = FastAPI(...)`. L'import declenche :
+1. Import de `config.py` (detection device, creation dossiers)
+2. Import de `routers/` (enregistrement des routes)
+3. Creation de `app` avec lifespan
+
+C'est exactement ce que les tests attendent. **Aucune modification des tests necessaire.**
+
+Si a l'avenir `main.py` est renomme en `server.py`, mettre a jour `conftest.py` : `from server import app`.
+
+---
+
 ## Regles de migration
 
 1. **Zero changement d'API** : memes routes, memes parametres, memes reponses
@@ -448,3 +492,4 @@ model = load_voice_design_model()  # Retourne le modele (lazy load si needed)
 |---------|------|-------------|
 | v1.0 | 2026-03-20 | Creation |
 | v2.0 | 2026-03-20 | Audit connus/inconnus : graphe dependances verifie (acyclique), couplage MCP identifie (must be after register_all), side effects import documentes, pattern app.state pour MCP/templates, detail par module avec lignes source |
+| v2.1 | 2026-03-20 | Evaluation : placement limiter/setup_logging/langdetect dans config.py, compatibilite tests (from main import app stable), code complet config.py avec les 3 objets orphelins |
