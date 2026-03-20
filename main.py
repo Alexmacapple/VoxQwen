@@ -20,6 +20,7 @@ import tempfile
 import uuid
 import asyncio
 import logging
+from logging.handlers import RotatingFileHandler
 import time
 import zipfile
 from contextlib import asynccontextmanager
@@ -117,8 +118,43 @@ _generation_stats = {
     "rejected_503": 0,
 }
 
-logger = logging.getLogger("voxqwen")
-logger.setLevel(logging.INFO)
+def setup_logging():
+    """Configure le logging avec rotation fichier + console."""
+    log_dir = Path(__file__).parent / "logs"
+    log_dir.mkdir(exist_ok=True)
+
+    json_formatter = logging.Formatter(
+        '{"ts":"%(asctime)s","level":"%(levelname)s","logger":"%(name)s","msg":"%(message)s"}'
+    )
+    console_formatter = logging.Formatter(
+        "%(asctime)s [%(name)s] %(levelname)s %(message)s"
+    )
+
+    file_handler = RotatingFileHandler(
+        log_dir / "voxqwen.log",
+        maxBytes=10 * 1024 * 1024,
+        backupCount=5,
+        encoding="utf-8",
+    )
+    file_handler.setFormatter(json_formatter)
+    file_handler.setLevel(logging.INFO)
+
+    console_handler = logging.StreamHandler()
+    console_handler.setFormatter(console_formatter)
+    console_handler.setLevel(logging.INFO)
+
+    voxqwen_logger = logging.getLogger("voxqwen")
+    voxqwen_logger.setLevel(logging.INFO)
+    voxqwen_logger.addHandler(file_handler)
+    voxqwen_logger.addHandler(console_handler)
+
+    # Reduce noise from third-party libraries
+    logging.getLogger("uvicorn.access").setLevel(logging.WARNING)
+    logging.getLogger("httpx").setLevel(logging.WARNING)
+
+    return voxqwen_logger
+
+logger = setup_logging()
 
 
 def _try_empty_gpu_cache():
@@ -950,6 +986,34 @@ async def root():
     }
 
 
+@app.get("/health", tags=["Monitoring"], include_in_schema=False)
+async def health_probe():
+    """Probe de sante pour monitoring."""
+    healthy = True
+    checks = {}
+    try:
+        if DEVICE == "mps":
+            if hasattr(torch.mps, "current_allocated_memory"):
+                _ = torch.mps.current_allocated_memory()
+            checks["gpu"] = "ok"
+        elif DEVICE.startswith("cuda"):
+            _ = torch.cuda.memory_allocated()
+            checks["gpu"] = "ok"
+        else:
+            checks["gpu"] = "cpu"
+    except Exception:
+        checks["gpu"] = "error"
+        healthy = False
+    checks["models_dir"] = "ok" if MODELS_DIR.exists() else "missing"
+    if not MODELS_DIR.exists():
+        healthy = False
+    checks["voices_dir"] = "ok" if CUSTOM_VOICES_DIR.exists() else "missing"
+    return JSONResponse(
+        content={"status": "healthy" if healthy else "unhealthy", "version": API_VERSION, "device": DEVICE, "checks": checks},
+        status_code=200 if healthy else 503,
+    )
+
+
 @app.get("/languages", response_model=LanguagesResponse, tags=["Informations"])
 async def list_languages():
     """Liste les langues supportees et les modeles disponibles."""
@@ -982,6 +1046,8 @@ async def voice_design(request: Request, data: DesignRequest):
 
     Retourne : fichier WAV
     """
+    logger.info(f"POST /design: voice_instruct={data.voice_instruct!r}, text_len={len(data.text)}")
+
     async def do_generate():
         model = load_voice_design_model()
         language = LANGUAGE_MAP.get(data.language, "French")
@@ -1040,6 +1106,8 @@ async def voice_clone(
 
     Retourne : fichier WAV
     """
+    logger.info(f"POST /clone: voice=clone, text_len={len(text)}")
+
     tmp_path = None
     try:
         # Valider le parametre model
@@ -1285,6 +1353,8 @@ async def create_clone_prompt(
         prompt_id = store_prompt(prompt_items, model, name)
         prompt_data = get_prompt(prompt_id)
 
+        logger.info(f"Prompt clone cree: {prompt_id} (model={model})")
+
         return JSONResponse({
             "prompt_id": prompt_id,
             "name": name,
@@ -1526,6 +1596,8 @@ async def create_custom_voice(
             language=language,
         )
 
+        logger.info(f"Voix custom creee: {name} (source={source})")
+
         return JSONResponse({
             "status": "created",
             "voice": {
@@ -1601,6 +1673,8 @@ async def delete_custom_voice_route(name: str):
             detail=f"Voix personnalisée '{name}' non trouvée"
         )
 
+    logger.warning(f"Voix custom supprimee: {name}")
+
     return {
         "status": "deleted",
         "name": name,
@@ -1645,6 +1719,8 @@ async def preset_voice(
 
     Retourne : fichier WAV
     """
+    logger.info(f"POST /preset: voice={voice}, text_len={len(text)}")
+
     async def do_generate():
         language_full = LANGUAGE_MAP.get(language, "French")
 
@@ -1894,6 +1970,8 @@ async def batch_preset_voice(request: Request, data: BatchPresetRequest):
 
     Retourne : fichier ZIP
     """
+    logger.info(f"POST /batch/preset: {len(data.texts)} textes, voice={data.voice}")
+
     try:
         # Valider le nombre de textes
         if len(data.texts) > 100:
@@ -2011,6 +2089,8 @@ async def batch_voice_design(request: Request, data: BatchDesignRequest):
 
     Retourne : fichier ZIP
     """
+    logger.info(f"POST /batch/design: {len(data.texts)} textes, voice={data.voice_instruct!r}")
+
     try:
         # Valider le nombre de textes
         if len(data.texts) > 100:
@@ -2086,6 +2166,8 @@ async def batch_voice_clone(
 
     Retourne : fichier ZIP
     """
+    logger.info(f"POST /batch/clone: voice=clone(prompt={prompt_id})")
+
     tmp_path = None
     try:
         # Parser les textes (séparés par newline)
