@@ -2,7 +2,7 @@
 
 **Version** : v2.0
 **Date** : 2026-03-20
-**Statut** : A faire
+**Statut** : Terminé
 **Priorite** : Haute
 **Effort estime** : 6 heures
 

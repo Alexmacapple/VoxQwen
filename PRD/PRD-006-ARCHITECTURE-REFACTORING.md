@@ -2,7 +2,7 @@
 
 **Version** : v2.0
 **Date** : 2026-03-20
-**Statut** : A faire
+**Statut** : Terminé
 **Priorite** : Moyenne (post-production)
 **Effort estime** : 2-3 jours (7h)
 **Dependance** : PRD-004 et PRD-005 termines
