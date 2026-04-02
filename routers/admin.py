@@ -16,7 +16,8 @@ from models import (
     load_preset_voice_model, load_clone_base_model,
     _get_gpu_memory_info,
 )
-from voices import voice_clone_prompts, custom_voices
+import voices
+from voices import voice_clone_prompts
 import generation as _gen_module
 
 logger = logging.getLogger("voxqwen")
@@ -34,13 +35,13 @@ async def models_status():
         "clone_1_7b_loaded": _models_module.clone_model_1_7b is not None,
         "clone_0_6b_loaded": _models_module.clone_model_0_6b is not None,
         "prompts_cached": len(voice_clone_prompts),
-        "custom_voices_count": len(custom_voices),
-        "custom_voices_loaded_in_memory": sum(1 for v in custom_voices.values() if v["prompt_items"] is not None),
+        "voices.custom_voices_count": len(voices.custom_voices),
+        "voices.custom_voices_loaded_in_memory": sum(1 for v in voices.custom_voices.values() if v["prompt_items"] is not None),
         "device": DEVICE,
         "mps_available": torch.backends.mps.is_available(),
         "cuda_available": torch.cuda.is_available(),
         "models_dir": str(MODELS_DIR),
-        "custom_voices_dir": str(CUSTOM_VOICES_DIR),
+        "voices.custom_voices_dir": str(CUSTOM_VOICES_DIR),
         "gpu_memory": _get_gpu_memory_info(),
     }
 

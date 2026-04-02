@@ -16,7 +16,8 @@ from models import (
     load_voice_design_model, load_preset_voice_model,
     load_voice_clone_model, load_clone_base_model,
 )
-from voices import custom_voices, get_custom_voice_prompt
+import voices
+from voices import get_custom_voice_prompt
 from generation import with_generation_lock
 
 logger = logging.getLogger("voxqwen")
@@ -98,8 +99,8 @@ async def preset_voice(
                 speaker=voice,
             )
 
-        elif voice in custom_voices:
-            voice_data = custom_voices[voice]
+        elif voice in voices.custom_voices:
+            voice_data = voices.custom_voices[voice]
             meta = voice_data["meta"]
             pi = get_custom_voice_prompt(voice)
 
@@ -128,7 +129,7 @@ async def preset_voice(
                 )
 
         else:
-            all_voices = list(PRESET_VOICES.keys()) + list(custom_voices.keys())
+            all_voices = list(PRESET_VOICES.keys()) + list(voices.custom_voices.keys())
             raise HTTPException(
                 status_code=400,
                 detail=f"Voix '{voice}' inconnue. Disponibles : {', '.join(all_voices)}"
@@ -176,7 +177,7 @@ async def preset_voice_with_instruct(
     """
     # Validation hors semaphore
     if voice not in PRESET_VOICES:
-        if voice in custom_voices:
+        if voice in voices.custom_voices:
             raise HTTPException(
                 status_code=400,
                 detail=f"La voix personnalisee '{voice}' ne supporte pas /preset/instruct. Utilisez /preset."

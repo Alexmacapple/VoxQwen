@@ -17,7 +17,8 @@ from schemas import BatchPresetRequest, BatchDesignRequest
 from models import (
     load_preset_voice_model, load_voice_design_model, load_clone_base_model,
 )
-from voices import custom_voices, get_custom_voice_prompt, get_prompt
+import voices
+from voices import get_custom_voice_prompt, get_prompt
 from generation import with_generation_lock
 
 logger = logging.getLogger("voxqwen")
@@ -47,10 +48,10 @@ async def batch_preset_voice(request: Request, data: BatchPresetRequest):
         language_full = resolve_language(data.language, first_text)
 
         is_native = data.voice in PRESET_VOICES
-        is_custom = data.voice in custom_voices
+        is_custom = data.voice in voices.custom_voices
 
         if not is_native and not is_custom:
-            all_voices = list(PRESET_VOICES.keys()) + list(custom_voices.keys())
+            all_voices = list(PRESET_VOICES.keys()) + list(voices.custom_voices.keys())
             raise HTTPException(
                 status_code=400,
                 detail=f"Voix '{data.voice}' inconnue. Disponibles : {', '.join(all_voices)}"
@@ -74,7 +75,7 @@ async def batch_preset_voice(request: Request, data: BatchPresetRequest):
                             speaker=data.voice,
                         )
                     else:
-                        voice_data = custom_voices[data.voice]
+                        voice_data = voices.custom_voices[data.voice]
                         meta = voice_data["meta"]
                         pi = get_custom_voice_prompt(data.voice)
 
